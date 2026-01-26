@@ -187,7 +187,7 @@ func runScanner(_ *cobra.Command, _ []string) error {
 	log.Println("🔍 Scanning for users with GitHub connections...")
 
 	query := `
-		FOR u IN users 
+		FOR u IN users
 		FILTER u.github_installation_id != null AND u.github_installation_id != ""
 		RETURN u
 	`
@@ -855,7 +855,7 @@ func generateSBOMFromInput(ctx context.Context, input string) ([]byte, string, e
 	}
 
 	cfg := cyclonedxjson.DefaultEncoderConfig()
-	enc := cyclonedxjson.NewFormatEncoderWithConfig(cfg)
+	enc, _ := cyclonedxjson.NewFormatEncoderWithConfig(cfg)
 	var buf bytes.Buffer
 	if err := enc.Encode(&buf, *s); err != nil {
 		return nil, "", err
