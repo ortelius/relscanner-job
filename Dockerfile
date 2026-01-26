@@ -21,4 +21,4 @@ ENV GITHUB_CLIENT_ID=Iv23liVE3QJYlS6BGQRa
 
 EXPOSE 8080
 
-ENTRYPOINT [ "/app/main" ]
+ENTRYPOINT [ "/app/main", "process-workflow" ]
