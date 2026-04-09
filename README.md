@@ -35,7 +35,7 @@ Once synced, these records are available in the Ortelius UI and API for dependen
 
 ## Connect Your GitHub Repositories
 
-Before the scanner can discover your releases, connect your GitHub account via **Profile → Connect GitHub** in the Ortelius UI. This installs the PDVD GitHub App on your account or organization and stores your installation ID in ArangoDB, which the scanner uses to generate a short-lived token and access your repositories on every run. Full instructions are in [Connect Your GitHub Repositories](https://docs.ortelius.io/guides/userguide/) in the Getting Started guide.
+Before the scanner can discover your releases, connect your GitHub account via **Profile → Connect GitHub** in the Ortelius UI. This installs the Ortelius GitHub App on your account or organization and stores your installation ID in ArangoDB, which the scanner uses to generate a short-lived token and access your repositories on every run. Full instructions are in [Connect Your GitHub Repositories](https://docs.ortelius.io/guides/userguide/) in the Getting Started guide.
 
 ## Schedule
 
