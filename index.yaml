@@ -7,7 +7,7 @@ entries:
     description: Release Scanner Worker
     digest: 9d2dbfa64606abb24212144fe4b1dc5f4100cbf9a46d36b31114b38792696469
     icon: https://ortelius.github.io/helmcharts/ortelius.svg
-    name: pdvd-relscanner-job
+    name: relscanner-job
     type: application
     urls:
     - https://github.com/ortelius/relscanner-job/releases/download/v12.0.18/relscanner-job-12.0.18.tgz
