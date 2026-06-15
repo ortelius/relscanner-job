@@ -43,6 +43,11 @@ spec:
                   secretKeyRef:
                     name: github-creds  # Matches secret.yaml metadata.name
                     key: PrivateKey     # Matches secret.yaml data.PrivateKey
+              - name: GITHUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: github-creds  
+                    key: ReadOnlyToken                      
               - name: ARANGO_USER
                 valueFrom:
                   secretKeyRef:
