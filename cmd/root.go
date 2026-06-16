@@ -1435,6 +1435,10 @@ func findLatestRelevantRuns(ctx context.Context, client *github.Client, owner, r
 		maxRuns = 5
 	}
 
+	if lastProcessedID == -1 {
+		return nil, -1, fmt.Errorf("no relevant successful workflow runs found in latest %d workflow runs", maxRuns)
+	}
+
 	runs, _, err := client.Actions.ListRepositoryWorkflowRuns(ctx, owner, repoName, &github.ListWorkflowRunsOptions{
 		Status: "success",
 		ListOptions: github.ListOptions{
@@ -1488,7 +1492,11 @@ func findLatestRelevantRuns(ctx context.Context, client *github.Client, owner, r
 	}
 
 	if len(targets) == 0 {
-		return nil, highestSeenID, fmt.Errorf("no relevant successful workflow runs found in latest %d workflow runs", maxRuns)
+		checkpoint := highestSeenID
+		if checkpoint == 0 {
+			checkpoint = -1
+		}
+		return nil, checkpoint, fmt.Errorf("no relevant successful workflow runs found in latest %d workflow runs", maxRuns)
 	}
 
 	for i, j := 0, len(targets)-1; i < j; i, j = i+1, j-1 {
