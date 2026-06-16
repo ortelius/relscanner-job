@@ -357,9 +357,6 @@ func runScanner(_ *cobra.Command, _ []string) error {
 func getTokenForRepo(repo model.TrackedRepo, org model.Org) (string, error) {
 	switch repo.Provider {
 	case "github":
-		// Public tracked GitHub repositories do not need to be installed on the
-		// GitHub App. Use GITHUB_TOKEN for rate limits and access, which allows
-		// public repos like curl/curl to be scanned from org.tracked_repos.
 		if !repo.Private {
 			token := os.Getenv("GITHUB_TOKEN")
 			if token == "" {
@@ -368,9 +365,6 @@ func getTokenForRepo(repo model.TrackedRepo, org model.Org) (string, error) {
 			return token, nil
 		}
 
-		// Private GitHub repos prefer the GitHub App installation token when the
-		// app is configured. If the app is not configured or token creation fails,
-		// fall through to an org PAT when available.
 		if org.GitHubInstallationID != "" && envAppID != "" && envPrivateKey != "" {
 			token, err := getInstallationToken(envAppID, envPrivateKey, org.GitHubInstallationID)
 			if err == nil {
@@ -417,15 +411,9 @@ func newGitHubClient(ctx context.Context, token string) *github.Client {
 }
 
 // processTrackedGitHubRepo processes a single GitHub repo from an org's tracked_repos list.
-// It reuses the existing processSingleRepo pipeline by constructing a GitHub client from
-// the resolved token, keeping parity with the app-installation flow.
-// isPublic is derived from !trackedRepo.Private and threaded through to buildRelease so
-// that releases from public repos are visible to unauthenticated GraphQL callers.
 func processTrackedGitHubRepo(ctx context.Context, token, owner, repoName string, isPublic bool, state *ScannerState) error {
-	repoKey := fmt.Sprintf("%s/%s", owner, repoName)
+	repoKey := fmt.Sprintf("github/%s/%s", owner, repoName)
 
-	// Dedup within a single scanner run — prevents double-processing when a repo
-	// appears in both org tracked_repos (Pass 2) and system_tracked_repos (Pass 3).
 	if state.VisitedThisRun == nil {
 		state.VisitedThisRun = make(map[string]bool)
 	}
@@ -437,7 +425,6 @@ func processTrackedGitHubRepo(ctx context.Context, token, owner, repoName string
 
 	client := newGitHubClient(ctx, token)
 
-	// Check if the repo is archived before processing
 	repo, _, err := client.Repositories.Get(ctx, owner, repoName)
 	if err != nil {
 		return fmt.Errorf("failed to get repo %s: %w", repoKey, err)
@@ -447,8 +434,6 @@ func processTrackedGitHubRepo(ctx context.Context, token, owner, repoName string
 		return nil
 	}
 
-	// Keep the existing workflow/container path, but do not let missing build logs
-	// block the source-release path used by projects like curl/curl.
 	if err := processSingleRepo(ctx, client, token, owner, repoName, isPublic, state.ProcessedRepos); err != nil {
 		log.Printf("      ⚠️  workflow scan skipped for %s/%s: %v", owner, repoName, err)
 	}
@@ -491,12 +476,19 @@ func processUserInstallation(ctx context.Context, installationID, _ string, stat
 }
 
 func processSingleRepo(ctx context.Context, client *github.Client, token, owner, repoName string, isPublic bool, processedRepos map[string]int64) error {
-	targets, err := findLatestRelevantRuns(ctx, client, owner, repoName, 5)
+	repoKey := fmt.Sprintf("github/%s/%s", owner, repoName)
+	lastProcessedID := processedRepos[repoKey]
+
+	targets, highestSeenID, err := findLatestRelevantRuns(ctx, client, owner, repoName, 5, lastProcessedID)
+
 	if err != nil {
+		if highestSeenID > processedRepos[repoKey] {
+			processedRepos[repoKey] = highestSeenID
+			log.Printf("      ⏭️  No actionable runs for %s/%s; checkpointing at run %d", owner, repoName, highestSeenID)
+		}
 		return err
 	}
 
-	repoKey := fmt.Sprintf("%s/%s", owner, repoName)
 	var lastErr error
 	processedAny := false
 
@@ -541,7 +533,7 @@ func processWorkflowScanTarget(
 		return fmt.Errorf("workflow run %d has no analysis", runID)
 	}
 
-	repoKey := fmt.Sprintf("%s/%s", owner, repoName)
+	repoKey := fmt.Sprintf("github/%s/%s", owner, repoName)
 
 	var gitDetails *GitDetails
 	if analysis.DockerImage != "" {
@@ -703,7 +695,6 @@ func processGitHubSourceReleases(ctx context.Context, client *github.Client, tok
 		}
 
 		for _, ghRelease := range releases {
-			// Include release candidates / prereleases, but still skip drafts.
 			if ghRelease.GetDraft() {
 				continue
 			}
@@ -726,8 +717,6 @@ func processGitHubSourceReleases(ctx context.Context, client *github.Client, tok
 		opt.Page = resp.NextPage
 	}
 
-	// GitHub returns newest-first; process oldest-first among the selected latest 5
-	// so the checkpoint always points at the newest successfully processed release.
 	sort.Slice(pending, func(i, j int) bool { return pending[i].GetID() < pending[j].GetID() })
 
 	for _, ghRelease := range pending {
@@ -785,9 +774,6 @@ func processGitHubSourceRelease(ctx context.Context, client *github.Client, toke
 			if _, err := os.Stat(filepath.Join(tempDir, ".git")); err == nil {
 				return nil
 			}
-
-			// tempDir may have been used for a downloaded release asset. Replace it
-			// with a clean checkout dir before collecting git metadata or scanning source.
 			os.RemoveAll(tempDir)
 			tempDir = ""
 		}
@@ -821,7 +807,6 @@ func processGitHubSourceRelease(ctx context.Context, client *github.Client, toke
 		}
 	}
 
-	// 1. Prefer an SBOM that is attached directly to the GitHub Release.
 	if downloaded, err := downloadGitHubReleaseSBOMAsset(ctx, client, owner, repoName, ghRelease.GetID()); err == nil && len(downloaded) > 0 {
 		if cleaned, cleanErr := cleanupCycloneDXMainComponent(downloaded, owner, repoName, version); cleanErr == nil {
 			sbomBytes = cleaned
@@ -835,9 +820,6 @@ func processGitHubSourceRelease(ctx context.Context, client *github.Client, toke
 		log.Printf("      ℹ️  No SBOM release asset for %s/%s %s: %v", owner, repoName, tagName, err)
 	}
 
-	// 2. If there is no SBOM asset, prefer scanning a packaged Java release artifact
-	//    before scanning source. WAR/JAR/EAR/HPI/JPI files contain resolved Maven
-	//    dependency versions that source POM scans can report as UNKNOWN.
 	if len(sbomBytes) == 0 {
 		assetPath, assetName, err := downloadGitHubReleaseJavaArtifactAsset(ctx, client, owner, repoName, ghRelease.GetID(), ensureTempDir)
 		if err == nil && assetPath != "" {
@@ -857,7 +839,6 @@ func processGitHubSourceRelease(ctx context.Context, client *github.Client, toke
 		}
 	}
 
-	// 3. Fall back to checking out the tag and scanning source.
 	if len(sbomBytes) == 0 {
 		if err := ensureCheckout(); err != nil {
 			return err
@@ -888,8 +869,6 @@ func processGitHubSourceRelease(ctx context.Context, client *github.Client, toke
 		}
 	}
 
-	// Keep a checkout available for git metadata. If an SBOM or Java artifact existed,
-	// this may be the only time we clone the release tag.
 	if err := ensureCheckout(); err != nil {
 		return err
 	}
@@ -998,7 +977,6 @@ func isJavaReleaseArtifactAsset(name string) bool {
 		return false
 	}
 
-	// Avoid side artifacts that do not represent the runtime deliverable.
 	if strings.Contains(n, "-sources.") ||
 		strings.Contains(n, "-javadoc.") ||
 		strings.Contains(n, "-tests.") ||
@@ -1116,9 +1094,6 @@ func resolveGitHubReleaseCommit(ctx context.Context, client *github.Client, owne
 }
 
 func releaseVersionFromGitHubRelease(owner, repoName string, ghRelease *github.RepositoryRelease) string {
-	// The tag is the checkout ref and usually contains the precise package version.
-	// For curl, release name may be "8.20" while the tag is "curl-8_20_0";
-	// the package/SBOM version should be "8.20.0".
 	version := normalizeComponentVersion(owner, repoName, ghRelease.GetTagName())
 	if version != "" {
 		return version
@@ -1134,7 +1109,6 @@ func normalizeComponentVersion(owner, repoName, tag string) string {
 	v = strings.TrimPrefix(v, "refs/tags/")
 	v = strings.TrimPrefix(v, "v")
 
-	// curl tags use curl-8_20_0 while the package version should be 8.20.0.
 	if owner == "curl" && repoName == "curl" {
 		v = strings.TrimPrefix(v, "curl-")
 		v = strings.ReplaceAll(v, "_", ".")
@@ -1456,7 +1430,7 @@ func cleanStereoscopeTemps() {
 	}
 }
 
-func findLatestRelevantRuns(ctx context.Context, client *github.Client, owner string, repoName string, maxRuns int) ([]WorkflowScanTarget, error) {
+func findLatestRelevantRuns(ctx context.Context, client *github.Client, owner, repoName string, maxRuns int, lastProcessedID int64) ([]WorkflowScanTarget, int64, error) {
 	if maxRuns <= 0 {
 		maxRuns = 5
 	}
@@ -1468,12 +1442,22 @@ func findLatestRelevantRuns(ctx context.Context, client *github.Client, owner st
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list workflow runs for %s/%s: %w", owner, repoName, err)
+		return nil, 0, fmt.Errorf("failed to list workflow runs for %s/%s: %w", owner, repoName, err)
 	}
 
 	var targets []WorkflowScanTarget
+	var highestSeenID int64
 
 	for _, run := range runs.WorkflowRuns {
+		if run.GetID() > highestSeenID {
+			highestSeenID = run.GetID()
+		}
+
+		if run.GetID() <= lastProcessedID {
+			log.Printf("      ⏭️  workflow run %s/%s %d already processed, skipping", owner, repoName, run.GetID())
+			continue
+		}
+
 		event := run.GetEvent()
 		if event == "pull_request" || event == "pull_request_target" {
 			log.Printf("      ⏭️  Skipping PR workflow run %s/%s %d", owner, repoName, run.GetID())
@@ -1504,15 +1488,14 @@ func findLatestRelevantRuns(ctx context.Context, client *github.Client, owner st
 	}
 
 	if len(targets) == 0 {
-		return nil, fmt.Errorf("no relevant successful workflow runs found in latest %d workflow runs", maxRuns)
+		return nil, highestSeenID, fmt.Errorf("no relevant successful workflow runs found in latest %d workflow runs", maxRuns)
 	}
 
-	// GitHub returns newest-first; process oldest-first.
 	for i, j := 0, len(targets)-1; i < j; i, j = i+1, j-1 {
 		targets[i], targets[j] = targets[j], targets[i]
 	}
 
-	return targets, nil
+	return targets, highestSeenID, nil
 }
 
 func fetchAndAnalyzeRun(ctx context.Context, client *github.Client, owner, repo string, runID int64) (*LogAnalysis, error) {
@@ -1953,8 +1936,6 @@ func gitCloneCheckout(repoURL, commitSHA, dest string) error {
 		return fmt.Errorf("empty commit SHA")
 	}
 
-	// Keep this shallow. A depth-2 clone is enough when the target commit is near
-	// the fetched ref and gives us the first parent needed for line-diff metrics.
 	if err := exec.Command("git", "clone", "--depth", "2", repoURL, dest).Run(); err == nil {
 		if err := exec.Command("git", "-C", dest, "checkout", "-b", "relscanner-checkout", commitSHA).Run(); err == nil {
 			_ = gitEnsurePreviousCommit(dest, commitSHA)
@@ -1962,7 +1943,6 @@ func gitCloneCheckout(repoURL, commitSHA, dest string) error {
 		}
 	}
 
-	// Fallback without a full clone: fetch only the requested commit at depth 2.
 	if err := resetGitDir(dest); err != nil {
 		return err
 	}
@@ -1988,8 +1968,6 @@ func gitCloneCheckoutRef(repoURL, ref, dest string) error {
 		return fmt.Errorf("empty git ref")
 	}
 
-	// Source releases are tag-based. Use depth 2, not a full clone, so HEAD and
-	// HEAD^ are available for commit metadata and line-diff counts.
 	if err := exec.Command("git", "clone", "--depth", "2", "--branch", ref, repoURL, dest).Run(); err == nil {
 		if head, resolveErr := gitResolveHead(dest); resolveErr == nil {
 			_ = gitEnsurePreviousCommit(dest, head)
@@ -1997,7 +1975,6 @@ func gitCloneCheckoutRef(repoURL, ref, dest string) error {
 		return nil
 	}
 
-	// Fallback without a full clone. Fetch only this tag/ref at depth 2.
 	if err := resetGitDir(dest); err != nil {
 		return err
 	}
@@ -2044,13 +2021,10 @@ func gitEnsurePreviousCommit(repoDir, commitSHA string) error {
 		commitSHA = resolved
 	}
 
-	// Already have the first parent.
 	if err := exec.Command("git", "-C", repoDir, "rev-parse", "--verify", commitSHA+"^").Run(); err == nil {
 		return nil
 	}
 
-	// Deepen a few commits at most. This avoids --unshallow / full history while
-	// still obtaining HEAD^ for normal release tags.
 	var lastErr error
 	for i := 0; i < 5; i++ {
 		if err := exec.Command("git", "-C", repoDir, "fetch", "--deepen", "1", "origin").Run(); err != nil {
