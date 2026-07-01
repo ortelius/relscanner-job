@@ -26,46 +26,60 @@ spec:
           nodeSelector:
             kubernetes.io/os: linux
           containers:
-          - name: {{ include "microservice.name" . }}
-            image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-            imagePullPolicy: IfNotPresent
-            env:
-              - name: API_BASE_URL
-                value: {{ .Values.env.apiBaseUrl | quote }}
-              # Source GitHub creds from 'github-creds' secret
-              - name: GITHUB_APP_ID
-                valueFrom:
-                  secretKeyRef:
-                    name: github-creds  # Matches secret.yaml metadata.name
-                    key: AppId          # Matches secret.yaml data.AppId
-              - name: GITHUB_PRIVATE_KEY
-                valueFrom:
-                  secretKeyRef:
-                    name: github-creds  # Matches secret.yaml metadata.name
-                    key: PrivateKey     # Matches secret.yaml data.PrivateKey
-              - name: GITHUB_TOKEN
-                valueFrom:
-                  secretKeyRef:
-                    name: github-creds  
-                    key: ReadOnlyToken                      
-              - name: ARANGO_USER
-                valueFrom:
-                  secretKeyRef:
-                    name: arangodb
-                    key: DBUserName
-              - name: ARANGO_PASS
-                valueFrom:
-                  secretKeyRef:
-                    name: arangodb
-                    key: DBPassword
-              - name: ARANGO_HOST
-                valueFrom:
-                  secretKeyRef:
-                    name: arangodb
-                    key: DBHost
-              - name: ARANGO_PORT
-                valueFrom:
-                  secretKeyRef:
-                    name: arangodb
-                    key: DBPort
+            - name: {{ include "microservice.name" . }}
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: Always
+              env:
+                - name: ARANGO_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: arangodb
+                      key: DBUserName
+                - name: ARANGO_PASS
+                  valueFrom:
+                    secretKeyRef:
+                      name: arangodb
+                      key: DBPassword
+                - name: ARANGO_HOST
+                  valueFrom:
+                    secretKeyRef:
+                      name: arangodb
+                      key: DBHost
+                - name: ARANGO_PORT
+                  valueFrom:
+                    secretKeyRef:
+                      name: arangodb
+                      key: DBPort
+                # --- Non-secret config: plain values straight from .Values ---
+                - name: API_BASE_URL
+                  value: "{{ .Values.apiBaseUrl }}"
+                - name: BASE_URL
+                  value: "{{ .Values.baseUrl }}"
+                - name: GITHUB_APP_NAME
+                  value: "{{ .Values.github.appName }}"
+                - name: GITHUB_APP_ID
+                  value: "{{ .Values.github.appId }}"
+                - name: GITHUB_CLIENT_ID
+                  value: "{{ .Values.github.clientId }}"
+                # --- True secrets: pulled from Secret objects ---
+                - name: GITHUB_CLIENT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-creds
+                      key: ClientSecret
+                - name: GITHUB_PRIVATE_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-creds
+                      key: PrivateKey
+                - name: GITHUB_READONLY_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-creds
+                      key: ReadOnlyToken
+                - name: TOKEN_ENCRYPTION_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: token-encryption
+                      key: TokenEncryptionKey
           restartPolicy: OnFailure
