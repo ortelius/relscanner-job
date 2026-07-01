@@ -42,6 +42,7 @@ import (
 	// Import shared packages from the backend
 	"github.com/ortelius/ortelius/v12/database"
 	"github.com/ortelius/ortelius/v12/model"
+	"github.com/ortelius/ortelius/v12/restapi/modules/lifecycle"
 	"github.com/ortelius/ortelius/v12/util"
 
 	"github.com/spf13/cobra"
@@ -344,6 +345,24 @@ func runScanner(_ *cobra.Command, _ []string) error {
 	}
 
 	saveScannerState(ctx, &dbConn, state)
+
+	// ----------------------------------------------------------------
+	// Pass 4: Seed cve_lifecycle sentinel records for ALL release versions
+	// (not just is_latest) so the trend chart has full historical data.
+	// After seeding, IngestAllUndeployedReleases calls
+	// ReconcileSentinelRemediations internally for every release touched,
+	// marking CVEs as remediated when they drop out of a newer version.
+	//
+	// Must run AFTER the release scan passes so release2cve edges are
+	// fully populated. Safe to re-run — idempotent guard on sentinel records.
+	// ----------------------------------------------------------------
+	log.Println("🔍 [Pass 4] Seeding release-based lifecycle records for all versions...")
+	if err := lifecycle.IngestAllUndeployedReleases(ctx, &dbConn, ""); err != nil {
+		log.Printf("⚠️  release lifecycle seeding failed: %v", err)
+	} else {
+		log.Println("✅ [Pass 4] Release lifecycle seeding and remediation reconcile complete")
+	}
+
 	return nil
 }
 
