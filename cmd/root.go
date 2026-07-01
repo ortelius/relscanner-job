@@ -357,7 +357,7 @@ func runScanner(_ *cobra.Command, _ []string) error {
 	// fully populated. Safe to re-run — idempotent guard on sentinel records.
 	// ----------------------------------------------------------------
 	log.Println("🔍 [Pass 4] Seeding release-based lifecycle records for all versions...")
-	if err := lifecycle.IngestAllUndeployedReleases(ctx, &dbConn, ""); err != nil {
+	if err := lifecycle.IngestAllUndeployedReleases(ctx, dbConn, ""); err != nil {
 		log.Printf("⚠️  release lifecycle seeding failed: %v", err)
 	} else {
 		log.Println("✅ [Pass 4] Release lifecycle seeding and remediation reconcile complete")
