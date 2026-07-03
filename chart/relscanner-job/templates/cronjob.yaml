@@ -50,17 +50,17 @@ spec:
                     secretKeyRef:
                       name: arangodb
                       key: DBPort
-                # --- Non-secret config: plain values straight from .Values ---
+                # --- Non-secret config: shared values from .Values.global ---
                 - name: API_BASE_URL
-                  value: "{{ .Values.apiBaseUrl }}"
+                  value: "{{ .Values.global.apiBaseUrl }}"
                 - name: BASE_URL
-                  value: "{{ .Values.baseUrl }}"
+                  value: "{{ .Values.global.baseUrl }}"
                 - name: GITHUB_APP_NAME
-                  value: "{{ .Values.github.appName }}"
+                  value: "{{ .Values.global.github.appName }}"
                 - name: GITHUB_APP_ID
-                  value: "{{ .Values.github.appId }}"
+                  value: "{{ .Values.global.github.appId }}"
                 - name: GITHUB_CLIENT_ID
-                  value: "{{ .Values.github.clientId }}"
+                  value: "{{ .Values.global.github.clientId }}"
                 # --- True secrets: pulled from Secret objects ---
                 - name: GITHUB_CLIENT_SECRET
                   valueFrom:
