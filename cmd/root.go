@@ -322,9 +322,9 @@ func runScanner(_ *cobra.Command, _ []string) error {
 				continue
 			}
 
-			token := os.Getenv("GITHUB_TOKEN")
+			token := os.Getenv("GITHUB_READONLY_TOKEN")
 			if repo.Provider == "gitlab" {
-				token = os.Getenv("GITLAB_TOKEN")
+				token = os.Getenv("GITHUB_READONLY_TOKEN")
 			}
 
 			log.Printf("   🌐 [Pass 3] Processing public repo %s/%s/%s", repo.Provider, repo.Owner, repo.Name)
@@ -372,14 +372,14 @@ func runScanner(_ *cobra.Command, _ []string) error {
 //  1. GitHub App installation token (preferred — covers private + public)
 //  2. Org GitHub PAT (fallback for private GitHub repos without app)
 //  3. Org GitLab PAT (required for all GitLab repos)
-//  4. System GITHUB_TOKEN (public repos only, for rate limit purposes)
+//  4. System GITHUB_READONLY_TOKEN (public repos only, for rate limit purposes)
 func getTokenForRepo(repo model.TrackedRepo, org model.Org) (string, error) {
 	switch repo.Provider {
 	case "github":
 		if !repo.Private {
-			token := os.Getenv("GITHUB_TOKEN")
+			token := os.Getenv("GITHUB_READONLY_TOKEN")
 			if token == "" {
-				log.Printf("⚠️  GITHUB_TOKEN is empty; using unauthenticated GitHub API for public repo %s/%s", repo.Owner, repo.Name)
+				log.Printf("⚠️  GITHUB_READONLY_TOKEN is empty; using unauthenticated GitHub API for public repo %s/%s", repo.Owner, repo.Name)
 			}
 			return token, nil
 		}
