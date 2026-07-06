@@ -217,10 +217,7 @@ func saveScannerState(ctx context.Context, dbConn *database.DBConnection, state 
 // -------------------- WORKER LOGIC --------------------
 
 func runScanner(_ *cobra.Command, _ []string) error {
-	serverURL = os.Getenv("API_BASE_URL")
-	if serverURL == "" {
-		serverURL = "http://localhost:3000"
-	}
+	serverURL = util.GetEnvOrDefault("API_BASE_URL", "http://localhost:3000")
 
 	githubAppConfigured := envAppID != "" && envPrivateKey != ""
 	if !githubAppConfigured {
@@ -1394,7 +1391,10 @@ func cleanupCycloneDXMainComponent(sbomBytes []byte, owner, repoName, componentV
 		bom["metadata"] = metadata
 	}
 
-	purl := fmt.Sprintf("pkg:github/%s/%s@%s", owner, repoName, componentVersion)
+	// Reuse the shared, centrally-normalized purl builder (same one CVE
+	// matching uses) instead of hand-rolling the string, so owner/repo
+	// casing is consistent with every other consumer of github purls.
+	purl := util.GetBasePURLFromComponents("Github", owner, repoName) + "@" + componentVersion
 
 	metadata["component"] = map[string]interface{}{
 		"type":    "application",
@@ -1414,7 +1414,10 @@ func cleanupCycloneDXMainComponent(sbomBytes []byte, owner, repoName, componentV
 }
 
 func minimalCycloneDXSBOM(owner, repoName, componentVersion string) []byte {
-	purl := fmt.Sprintf("pkg:github/%s/%s@%s", owner, repoName, componentVersion)
+	// Reuse the shared, centrally-normalized purl builder (same one CVE
+	// matching uses) instead of hand-rolling the string, so owner/repo
+	// casing is consistent with every other consumer of github purls.
+	purl := util.GetBasePURLFromComponents("Github", owner, repoName) + "@" + componentVersion
 
 	bom := map[string]interface{}{
 		"bomFormat":   "CycloneDX",
