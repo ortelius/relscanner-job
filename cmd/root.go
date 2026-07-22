@@ -2080,13 +2080,40 @@ func gitResolveHead(repoDir string) (string, error) {
 }
 
 func postRelease(serverURL string, payload interface{}) error {
-	jsonData, _ := json.Marshal(payload)
-	resp, err := http.Post(serverURL+"/api/v1/releases", "application/json", bytes.NewBuffer(jsonData))
+	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal release payload: %w", err)
 	}
-	if resp.StatusCode != 201 {
-		return fmt.Errorf("status %d", resp.StatusCode)
+
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err := http.Post(serverURL+"/api/v1/releases", "application/json", bytes.NewBuffer(jsonData))
+		if err != nil {
+			lastErr = err
+		} else {
+			func() {
+				defer resp.Body.Close()
+				if resp.StatusCode == 201 {
+					lastErr = nil
+				} else {
+					lastErr = fmt.Errorf("status %d", resp.StatusCode)
+				}
+			}()
+			if lastErr == nil {
+				return nil
+			}
+		}
+
+		// Retry on network errors and 5xx (including Cloudflare's 5xx family like 525
+		// "SSL handshake failed") — these are typically transient origin/proxy issues,
+		// not payload problems, so retrying with backoff avoids silently dropping an
+		// otherwise-successful scan's results.
+		if attempt < maxAttempts {
+			backoff := time.Duration(attempt*attempt) * time.Second
+			log.Printf("      ⚠️  postRelease attempt %d/%d failed (%v), retrying in %s...", attempt, maxAttempts, lastErr, backoff)
+			time.Sleep(backoff)
+		}
 	}
-	return nil
+	return fmt.Errorf("postRelease failed after %d attempts: %w", maxAttempts, lastErr)
 }
