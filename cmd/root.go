@@ -254,7 +254,7 @@ func runScanner(_ *cobra.Command, _ []string) error {
 		for userCursor.HasMore() {
 			var user model.User
 			if _, err := userCursor.ReadDocument(ctx, &user); err == nil {
-				processUserInstallation(ctx, user.GitHubInstallationID, user.Username, state)
+				processUserInstallation(ctx, dbConn, user.GitHubInstallationID, user.Username, state)
 			}
 		}
 	}
@@ -288,7 +288,7 @@ func runScanner(_ *cobra.Command, _ []string) error {
 
 				switch trackedRepo.Provider {
 				case "github":
-					if err := processTrackedGitHubRepo(ctx, token, trackedRepo.Owner, trackedRepo.Name, !trackedRepo.Private, state); err != nil {
+					if err := processTrackedGitHubRepo(ctx, dbConn, token, trackedRepo.Owner, trackedRepo.Name, !trackedRepo.Private, state); err != nil {
 						log.Printf("⚠️  error processing %s/%s: %v", trackedRepo.Owner, trackedRepo.Name, err)
 					}
 				case "gitlab":
@@ -328,7 +328,7 @@ func runScanner(_ *cobra.Command, _ []string) error {
 
 			switch repo.Provider {
 			case "github":
-				if err := processTrackedGitHubRepo(ctx, token, repo.Owner, repo.Name, true, state); err != nil {
+				if err := processTrackedGitHubRepo(ctx, dbConn, token, repo.Owner, repo.Name, true, state); err != nil {
 					log.Printf("      ⚠️  error processing public github %s/%s: %v", repo.Owner, repo.Name, err)
 				}
 			case "gitlab":
@@ -427,7 +427,7 @@ func newGitHubClient(ctx context.Context, token string) *github.Client {
 }
 
 // processTrackedGitHubRepo processes a single GitHub repo from an org's tracked_repos list.
-func processTrackedGitHubRepo(ctx context.Context, token, owner, repoName string, isPublic bool, state *ScannerState) error {
+func processTrackedGitHubRepo(ctx context.Context, dbConn database.DBConnection, token, owner, repoName string, isPublic bool, state *ScannerState) error {
 	repoKey := fmt.Sprintf("github/%s/%s", owner, repoName)
 
 	if state.VisitedThisRun == nil {
@@ -454,10 +454,10 @@ func processTrackedGitHubRepo(ctx context.Context, token, owner, repoName string
 		log.Printf("      ⚠️  workflow scan skipped for %s/%s: %v", owner, repoName, err)
 	}
 
-	return processGitHubSourceReleases(ctx, client, token, owner, repoName, isPublic, state)
+	return processGitHubSourceReleases(ctx, dbConn, client, token, owner, repoName, isPublic, state)
 }
 
-func processUserInstallation(ctx context.Context, installationID, _ string, state *ScannerState) error {
+func processUserInstallation(ctx context.Context, dbConn database.DBConnection, installationID, _ string, state *ScannerState) error {
 	token, err := getInstallationToken(envAppID, envPrivateKey, installationID)
 	if err != nil {
 		return err
@@ -478,7 +478,7 @@ func processUserInstallation(ctx context.Context, installationID, _ string, stat
 				if err := processSingleRepo(ctx, client, token, repo.GetOwner().GetLogin(), repo.GetName(), !repo.GetPrivate(), state.ProcessedRepos); err != nil {
 					log.Printf("      ⚠️  workflow scan skipped for %s/%s: %v", repo.GetOwner().GetLogin(), repo.GetName(), err)
 				}
-				if err := processGitHubSourceReleases(ctx, client, token, repo.GetOwner().GetLogin(), repo.GetName(), !repo.GetPrivate(), state); err != nil {
+				if err := processGitHubSourceReleases(ctx, dbConn, client, token, repo.GetOwner().GetLogin(), repo.GetName(), !repo.GetPrivate(), state); err != nil {
 					log.Printf("      ⚠️  source-release scan skipped for %s/%s: %v", repo.GetOwner().GetLogin(), repo.GetName(), err)
 				}
 			}
@@ -692,8 +692,129 @@ func processWorkflowScanTarget(
 
 // -------------------- GITHUB SOURCE RELEASE LOGIC --------------------
 
-func processGitHubSourceReleases(ctx context.Context, client *github.Client, token, owner, repoName string, isPublic bool, state *ScannerState) error {
-	const maxSourceReleases = 5
+// getKnownReleaseVersions returns the set of release versions already present
+// in the `release` collection for a repo, normalized the same way GitHub tags
+// are (see normalizeComponentVersion) so they can be diffed against GitHub's
+// release list directly.
+func getKnownReleaseVersions(ctx context.Context, dbConn database.DBConnection, releaseName string) (map[string]bool, error) {
+	query := `FOR r IN release FILTER r.name == @name RETURN r.version`
+	cursor, err := dbConn.Database.Query(ctx, query, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{"name": releaseName},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query known release versions for %s: %w", releaseName, err)
+	}
+	defer cursor.Close()
+
+	known := make(map[string]bool)
+	for cursor.HasMore() {
+		var version string
+		if _, err := cursor.ReadDocument(ctx, &version); err == nil {
+			known[version] = true
+		}
+	}
+	return known, nil
+}
+
+// findEarliestMissingReleaseID scans a repo's GitHub releases (newest-first,
+// GitHub's default order) looking for gaps at or below the current watermark
+// — releases that were silently skipped by the old high-water-mark bug.
+//
+// Two bounds keep this cheap even for repos with hundreds of releases:
+//   - Releases with ID > watermark are skipped without a lookup: the normal
+//     fetch loop in processGitHubSourceReleases already re-includes anything
+//     above the watermark, gap or not, so there's nothing to detect there.
+//   - Once maxCheck releases at-or-below the watermark have been inspected,
+//     scanning stops. There's no point looking further back than one
+//     backfill run (backfillMaxReleases) could ever consume in a single
+//     pass — matches "don't worry about going all the way back in history."
+//     A gap older than that window just gets caught on a later run, once
+//     the watermark has advanced past the closer gaps first.
+//
+// Returns the smallest ID found missing within the checked window, or 0 if
+// none was found.
+func findEarliestMissingReleaseID(ctx context.Context, client *github.Client, owner, repoName string, known map[string]bool, watermark int64, maxCheck int) (int64, error) {
+	var earliestMissingID int64
+	checked := 0
+
+	opt := &github.ListOptions{PerPage: 100}
+	for checked < maxCheck {
+		releases, resp, err := client.Repositories.ListReleases(ctx, owner, repoName, opt)
+		if err != nil {
+			return 0, fmt.Errorf("failed to list releases for %s/%s: %w", owner, repoName, err)
+		}
+
+		for _, ghRelease := range releases {
+			if ghRelease.GetID() > watermark {
+				continue // handled by the normal fetch loop regardless of gaps
+			}
+			if ghRelease.GetDraft() || strings.TrimSpace(ghRelease.GetTagName()) == "" {
+				continue
+			}
+
+			checked++
+			version := releaseVersionFromGitHubRelease(owner, repoName, ghRelease)
+			if !known[version] {
+				earliestMissingID = ghRelease.GetID() // descending order: last hit = smallest ID
+			}
+			if checked >= maxCheck {
+				break
+			}
+		}
+
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
+	}
+
+	return earliestMissingID, nil
+}
+
+// resetWatermarkOnGap checks whether this repo's watermark has a gap behind
+// it (a release below LastReleaseID that never made it into the `release`
+// collection) and, if so, rewinds LastReleaseID to just before the earliest
+// missing release so the normal fetch loop below picks it — and everything
+// after it — back up. Only runs for repos that already have a watermark;
+// brand-new repos (LastReleaseID == 0) intentionally only ever get their
+// most recent releases, so there's nothing to backfill for them.
+func resetWatermarkOnGap(ctx context.Context, dbConn database.DBConnection, client *github.Client, owner, repoName string, lastState *ReleaseScanState, maxCheck int) error {
+	if lastState.LastReleaseID == 0 {
+		return nil
+	}
+
+	releaseName := fmt.Sprintf("%s/%s", owner, repoName)
+	known, err := getKnownReleaseVersions(ctx, dbConn, releaseName)
+	if err != nil {
+		return err
+	}
+
+	firstMissingID, err := findEarliestMissingReleaseID(ctx, client, owner, repoName, known, lastState.LastReleaseID, maxCheck)
+	if err != nil {
+		return err
+	}
+
+	if firstMissingID != 0 && firstMissingID-1 < lastState.LastReleaseID {
+		log.Printf("      🔎 watermark gap detected for %s: earliest missing release ID %d, rewinding watermark %d -> %d",
+			releaseName, firstMissingID, lastState.LastReleaseID, firstMissingID-1)
+		lastState.LastReleaseID = firstMissingID - 1
+	}
+	return nil
+}
+
+func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnection, client *github.Client, token, owner, repoName string, isPublic bool, state *ScannerState) error {
+	// newRepoMaxReleases caps the very first scan of a repo to just its most
+	// recent releases — that's the desired steady-state behavior, not a bug.
+	// backfillMaxReleases is used once a repo already has a watermark (i.e.
+	// LastReleaseID != 0), including a watermark that's just been rewound by
+	// resetWatermarkOnGap below. A higher cap here lets a reset watermark
+	// catch up in one run instead of trickling in maxSourceReleases-at-a-time
+	// across many cron cycles. Duplicate/already-known releases are safely
+	// re-affirmed, not re-inserted — see ProcessReleaseIngestion's
+	// composite-key dedup and CreateOrUpdateLifecycleRecord's existing-record
+	// check.
+	const newRepoMaxReleases = 5
+	const backfillMaxReleases = 99
 
 	if state.ProcessedReleases == nil {
 		state.ProcessedReleases = make(map[string]ReleaseScanState)
@@ -701,6 +822,16 @@ func processGitHubSourceReleases(ctx context.Context, client *github.Client, tok
 
 	repoKey := fmt.Sprintf("github/%s/%s", owner, repoName)
 	lastState := state.ProcessedReleases[repoKey]
+
+	if err := resetWatermarkOnGap(ctx, dbConn, client, owner, repoName, &lastState, backfillMaxReleases); err != nil {
+		log.Printf("      ⚠️  watermark gap check failed for %s/%s: %v", owner, repoName, err)
+	}
+
+	maxSourceReleases := newRepoMaxReleases
+	if lastState.LastReleaseID != 0 {
+		maxSourceReleases = backfillMaxReleases
+	}
+
 	var pending []*github.RepositoryRelease
 
 	opt := &github.ListOptions{PerPage: maxSourceReleases}
