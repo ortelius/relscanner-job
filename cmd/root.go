@@ -566,6 +566,21 @@ func processWorkflowScanTarget(
 		releaseVersion = analysis.ReleaseVersion
 	}
 
+	// No real docker tag or release version was found for this workflow
+	// run -- it's an untagged/ephemeral CI scan, not a real addressable
+	// release. Previously these were still ingested under a shared
+	// "0.0.0-snapshot" placeholder version, which broke release-ordering
+	// logic downstream (e.g. ReconcileSentinelRemediations comparing real
+	// releases against an unrelated snapshot SBOM) and piled up duplicate
+	// placeholder release documents with no stable identity to upsert
+	// against. Skip ingestion entirely instead. The run is still
+	// checkpointed so it isn't retried every scan cycle.
+	if releaseVersion == "0.0.0-snapshot" {
+		log.Printf("      ⏭️  skipping workflow run %s/%s %d: no tagged release/docker tag found (untagged CI scan, not ingested)", owner, repoName, runID)
+		processedRepos[repoKey] = runID
+		return nil
+	}
+
 	tempDir, _ := os.MkdirTemp("", "relscanner-*")
 	defer func() {
 		os.RemoveAll(tempDir)
