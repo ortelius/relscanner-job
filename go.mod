@@ -10,6 +10,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/go-containerregistry v0.21.7
 	github.com/google/go-github/v69 v69.2.0
+	github.com/google/go-github/v89 v89.0.0
 	github.com/ortelius/ortelius/v12 v12.0.513
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/oauth2 v0.36.0
