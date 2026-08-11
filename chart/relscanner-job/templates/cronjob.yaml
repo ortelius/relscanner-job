@@ -17,18 +17,39 @@ kind: CronJob
 metadata:
   name: {{ include "microservice.name" . }}
 spec:
-  schedule: "*/15 * * * *"
-  concurrencyPolicy: Forbid
+  schedule: {{ .Values.schedule | default "*/15 * * * *" | quote }}
+  concurrencyPolicy: {{ .Values.concurrencyPolicy | default "Forbid" }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit | default 3 }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit | default 1 }}
+  startingDeadlineSeconds: {{ .Values.startingDeadlineSeconds | default 120 }}
   jobTemplate:
     spec:
+      {{- with .Values.activeDeadlineSeconds }}
+      # Caps a run below the schedule interval. Without this, a stalled
+      # fetch pushes the run past 15 min and concurrencyPolicy: Forbid
+      # silently skips every subsequent tick.
+      activeDeadlineSeconds: {{ . }}
+      {{- end }}
+      backoffLimit: {{ .Values.backoffLimit | default 2 }}
+      {{- with .Values.ttlSecondsAfterFinished }}
+      ttlSecondsAfterFinished: {{ . }}
+      {{- end }}
       template:
         spec:
           nodeSelector:
-            kubernetes.io/os: linux
+            {{- toYaml (.Values.nodeSelector | default (dict "kubernetes.io/os" "linux")) | nindent 12 }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           containers:
             - name: {{ include "microservice.name" . }}
               image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-              imagePullPolicy: Always
+              imagePullPolicy: {{ .Values.image.pullPolicy | default "Always" }}
               env:
                 - name: ARANGO_USER
                   valueFrom:
@@ -82,4 +103,11 @@ spec:
                     secretKeyRef:
                       name: token-encryption
                       key: TokenEncryptionKey
-          restartPolicy: OnFailure
+                {{- with .Values.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              {{- with .Values.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+          restartPolicy: {{ .Values.restartPolicy | default "OnFailure" }}

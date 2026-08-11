@@ -10,3 +10,50 @@ env:
   apiBaseUrl: "https://app.deployhub.com"
   githubAppId: ""
   githubPrivateKey: ""
+
+schedule: "*/15 * * * *"
+concurrencyPolicy: Forbid
+restartPolicy: OnFailure
+startingDeadlineSeconds: 120
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 1
+backoffLimit: 2
+
+# Cap a run below the 15 min schedule interval so a stall fails fast and the
+# next tick still runs. Observed runs complete in 3-6 min, so 780s is ample.
+#
+# This matters even though relscanner has not stalled: cmd/root.go uses
+# http.Get and http.DefaultClient in several places, neither of which has a
+# timeout. A hung upstream there would produce the same silent skipping that
+# osvdev hit on the Ubuntu ecosystem fetch.
+activeDeadlineSeconds: 780
+
+# Reap completed pods; three Completed pods were accumulating per hour.
+ttlSecondsAfterFinished: 300
+
+extraEnv: []
+
+# Sized so both CronJobs co-schedule on one e2-standard-2 batch node
+# (~1930m allocatable, ~500m consumed by DaemonSets).
+resources:
+  requests:
+    cpu: 300m
+    memory: 1Gi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# Pin to the preemptible batch pool. The toleration is required: batch-pool
+# carries workload=batch:NoSchedule so nothing else can land there, and
+# without it these pods fall back onto system-pool alongside ArangoDB.
+nodeSelector:
+  kubernetes.io/os: linux
+  workload: batch
+
+tolerations:
+  - key: workload
+    operator: Equal
+    value: batch
+    effect: NoSchedule
+
+affinity: {}
