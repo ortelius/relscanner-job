@@ -344,20 +344,33 @@ func runScanner(_ *cobra.Command, _ []string) error {
 	saveScannerState(ctx, &dbConn, state)
 
 	// ----------------------------------------------------------------
-	// Pass 4: Seed cve_lifecycle sentinel records for ALL release versions
-	// (not just is_latest) so the trend chart has full historical data.
-	// After seeding, IngestAllUndeployedReleases calls
-	// ReconcileSentinelRemediations internally for every release touched,
-	// marking CVEs as remediated when they drop out of a newer version.
+	// Pass 4: Maintain bounded release-based CVE lifecycle history.
 	//
-	// Must run AFTER the release scan passes so release2cve edges are
-	// fully populated. Safe to re-run — idempotent guard on sentinel records.
+	// Ortelius owns the sentinel policy. The lifecycle package keeps only
+	// DefaultSentinelHistoryVersions (currently 4) real release versions per
+	// release, uses deterministic sentinel keys to prevent exact duplicates,
+	// prunes older versions, and recomputes remediation state inside the
+	// retained window.
+	//
+	// Must run AFTER the release scan passes so release2cve edges are fully
+	// populated. Safe to run every relscanner cycle.
 	// ----------------------------------------------------------------
-	log.Println("🔍 [Pass 4] Seeding release-based lifecycle records for all versions...")
-	if err := lifecycle.IngestAllUndeployedReleases(ctx, dbConn, ""); err != nil {
-		log.Printf("⚠️  release lifecycle seeding failed: %v", err)
+	log.Printf(
+		"🔍 [Pass 4] Maintaining release lifecycle history for latest %d versions...",
+		lifecycle.DefaultSentinelHistoryVersions,
+	)
+	if err := lifecycle.MaintainRecentSentinelHistory(
+		ctx,
+		dbConn,
+		"",
+		lifecycle.DefaultSentinelHistoryVersions,
+	); err != nil {
+		log.Printf("⚠️  release lifecycle maintenance failed: %v", err)
 	} else {
-		log.Println("✅ [Pass 4] Release lifecycle seeding and remediation reconcile complete")
+		log.Printf(
+			"✅ [Pass 4] Release lifecycle maintenance complete; retained latest %d versions",
+			lifecycle.DefaultSentinelHistoryVersions,
+		)
 	}
 
 	return nil
