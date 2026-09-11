@@ -43,9 +43,10 @@ import (
 	"github.com/arangodb/go-driver/v2/arangodb"
 
 	// Helm SDK, for in-process chart rendering (helm template equivalent)
-	"helm.sh/helm/v3/pkg/action"
-	"helm.sh/helm/v3/pkg/chart/loader"
-	"helm.sh/helm/v3/pkg/cli"
+	"helm.sh/helm/v4/pkg/action"
+	"helm.sh/helm/v4/pkg/chart/v2/loader"
+	"helm.sh/helm/v4/pkg/cli"
+	helmrelease "helm.sh/helm/v4/pkg/release/v1"
 
 	// Import shared packages from the backend
 	"github.com/ortelius/ortelius/v12/database"
@@ -1439,7 +1440,7 @@ func runHelmTemplateImages(chartDir string) ([]string, error) {
 }
 
 // renderHelmChartManifest loads a chart from disk and renders it exactly
-// like `helm template <chartDir>` would -- ClientOnly + DryRun means no
+// like `helm template <chartDir>` would -- action.DryRunClient means no
 // Kubernetes cluster is contacted and nothing is installed; Helm just
 // computes default capabilities and coalesces the chart's own values.yaml
 // (no --set/-f overrides, matching plain `helm template` with no extra
@@ -1452,16 +1453,18 @@ func renderHelmChartManifest(chartDir string) (string, error) {
 
 	settings := cli.New()
 	actionConfig := new(action.Configuration)
-	// "memory" storage driver + ClientOnly below means no Kubernetes API
-	// calls are ever made -- this stays entirely local.
-	nullLog := func(string, ...interface{}) {}
-	if err := actionConfig.Init(settings.RESTClientGetter(), settings.Namespace(), "memory", nullLog); err != nil {
+	// "memory" storage driver + DryRunClient below means no Kubernetes API
+	// calls are ever made -- this stays entirely local. Unlike Helm v3,
+	// Init() no longer takes a debug-log callback param.
+	if err := actionConfig.Init(settings.RESTClientGetter(), settings.Namespace(), "memory"); err != nil {
 		return "", fmt.Errorf("failed to init helm action config for %s: %w", chartDir, err)
 	}
 
 	client := action.NewInstall(actionConfig)
-	client.DryRun = true
-	client.ClientOnly = true
+	// Helm v4 replaced the old DryRun bool + ClientOnly bool pair with a
+	// single DryRunStrategy enum; DryRunClient is the local-only-render
+	// equivalent of v3's DryRun=true, ClientOnly=true.
+	client.DryRunStrategy = action.DryRunClient
 	client.Replace = true
 	client.IncludeCRDs = true
 	client.ReleaseName = "relscanner-job"
@@ -1472,11 +1475,18 @@ func renderHelmChartManifest(chartDir string) (string, error) {
 	// about fields we were never going to supply.
 	client.DisableOpenAPIValidation = true
 
+	// Run's return type is release.Releaser (an alias for `any` in v4, to
+	// support multiple release schema versions), so the concrete type has
+	// to be asserted before .Manifest is reachable.
 	rel, err := client.Run(chartRequested, chartRequested.Values)
 	if err != nil {
 		return "", fmt.Errorf("failed to render chart %s: %w", chartDir, err)
 	}
-	return rel.Manifest, nil
+	rendered, ok := rel.(*helmrelease.Release)
+	if !ok || rendered == nil {
+		return "", fmt.Errorf("unexpected release type rendering chart %s", chartDir)
+	}
+	return rendered.Manifest, nil
 }
 
 // imageLineRe matches any "image: <ref>" line in rendered Kubernetes YAML,
