@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -534,6 +535,15 @@ func processSingleRepo(ctx context.Context, client *github.Client, token, owner,
 		}
 
 		processedAny = true
+	}
+
+	// Every target that was attempted this cycle fully succeeded, so it's
+	// safe to also advance past any permanently-skippable runs above them
+	// (e.g. expired logs) that findLatestRelevantRuns already determined
+	// are never coming back. If any target failed, leave the watermark
+	// where per-target processing put it so that target retries next cycle.
+	if lastErr == nil && highestSeenID > processedRepos[repoKey] {
+		processedRepos[repoKey] = highestSeenID
 	}
 
 	if !processedAny && lastErr != nil {
@@ -1632,6 +1642,7 @@ func findLatestRelevantRuns(ctx context.Context, client *github.Client, owner, r
 
 	var targets []WorkflowScanTarget
 	var highestSeenID int64
+	var lowestUnresolvedID int64 // earliest run ID still worth retrying next cycle
 
 	for _, run := range runs.WorkflowRuns {
 		if run.GetID() > highestSeenID {
@@ -1651,7 +1662,20 @@ func findLatestRelevantRuns(ctx context.Context, client *github.Client, owner, r
 
 		analysis, err := fetchAndAnalyzeRun(ctx, client, owner, repoName, run.GetID())
 		if err != nil {
-			log.Printf("      ⚠️  failed to analyze workflow run %d for %s/%s: %v", run.GetID(), owner, repoName, err)
+			if isExpiredWorkflowLogs(err) {
+				// Permanent: GitHub has discarded these logs and never will
+				// have them again. Skip for good -- don't hold up the
+				// watermark waiting to retry something that can't succeed.
+				log.Printf("      ⏭️  workflow run %s/%s %d logs have expired on GitHub; giving up (will not retry)", owner, repoName, run.GetID())
+			} else {
+				// Possibly transient (network blip, rate limit, etc). Keep
+				// the watermark from advancing past this run so it gets
+				// retried next scan cycle.
+				log.Printf("      ⚠️  failed to analyze workflow run %d for %s/%s: %v (will retry next cycle)", run.GetID(), owner, repoName, err)
+				if lowestUnresolvedID == 0 || run.GetID() < lowestUnresolvedID {
+					lowestUnresolvedID = run.GetID()
+				}
+			}
 			continue
 		}
 
@@ -1672,8 +1696,16 @@ func findLatestRelevantRuns(ctx context.Context, client *github.Client, owner, r
 		})
 	}
 
+	// The watermark is only safe to advance up to the newest run that has
+	// no unresolved (possibly-transient) failure below it -- anything at or
+	// above a still-retryable failure must stay un-checkpointed.
+	safeWatermark := highestSeenID
+	if lowestUnresolvedID != 0 && lowestUnresolvedID-1 < safeWatermark {
+		safeWatermark = lowestUnresolvedID - 1
+	}
+
 	if len(targets) == 0 {
-		checkpoint := highestSeenID
+		checkpoint := safeWatermark
 		if checkpoint == 0 {
 			checkpoint = -1
 		}
@@ -1684,7 +1716,7 @@ func findLatestRelevantRuns(ctx context.Context, client *github.Client, owner, r
 		targets[i], targets[j] = targets[j], targets[i]
 	}
 
-	return targets, highestSeenID, nil
+	return targets, safeWatermark, nil
 }
 
 func fetchAndAnalyzeRun(ctx context.Context, client *github.Client, owner, repo string, runID int64) (*LogAnalysis, error) {
@@ -1695,6 +1727,18 @@ func fetchAndAnalyzeRun(ctx context.Context, client *github.Client, owner, repo 
 	defer resp.Body.Close()
 	logData, _ := downloadFile(url.String())
 	return parseLogs(logData)
+}
+
+// isExpiredWorkflowLogs reports whether err is GitHub's response for a
+// workflow run whose log archive has passed its retention window (410
+// Gone). This is permanent -- the logs are never coming back -- unlike
+// network blips or rate limiting, which should still be retried next cycle.
+func isExpiredWorkflowLogs(err error) bool {
+	var ghErr *github.ErrorResponse
+	if errors.As(err, &ghErr) && ghErr.Response != nil {
+		return ghErr.Response.StatusCode == http.StatusGone
+	}
+	return false
 }
 
 func downloadSBOMArtifact(ctx context.Context, client *github.Client, owner, repo string, runID int64) ([]byte, error) {
