@@ -2,7 +2,7 @@ FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260803.3@sha256:6d8e068b91
 
 WORKDIR /app
 
-ENV GO_VERSION=1.26.4
+ENV GO_VERSION=1.27.1
 ENV NODE_VERSION=24.16.0
 ENV PATH=/usr/local/go/bin:/usr/local/node/bin:$PATH
 

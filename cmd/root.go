@@ -3,9 +3,11 @@
 package cmd
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/x509"
 	"encoding/base64"
@@ -39,6 +41,11 @@ import (
 
 	// ArangoDB v2 Driver
 	"github.com/arangodb/go-driver/v2/arangodb"
+
+	// Helm SDK, for in-process chart rendering (helm template equivalent)
+	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart/loader"
+	"helm.sh/helm/v3/pkg/cli"
 
 	// Import shared packages from the backend
 	"github.com/ortelius/ortelius/v12/database"
@@ -1101,6 +1108,32 @@ func processGitHubSourceRelease(ctx context.Context, client *github.Client, toke
 	}
 
 	log.Printf("      🚀 Source release %s/%s %s synced (SHA: %s)", owner, repoName, version, release.ContentSha)
+
+	chartDirs, chartErr := downloadGitHubReleaseHelmChartAssets(ctx, client, owner, repoName, ghRelease.GetID(), ensureTempDir)
+	if chartErr != nil {
+		log.Printf("      ℹ️  No Helm chart release asset for %s/%s %s: %v", owner, repoName, tagName, chartErr)
+		return nil
+	}
+
+	for _, chartDir := range chartDirs {
+		images, tplErr := runHelmTemplateImages(chartDir)
+		if tplErr != nil {
+			log.Printf("      ⚠️  helm template failed for %s/%s %s (%s): %v", owner, repoName, tagName, filepath.Base(chartDir), tplErr)
+			continue
+		}
+		if len(images) == 0 {
+			log.Printf("      ℹ️  Helm chart %s for %s/%s %s references no container images", filepath.Base(chartDir), owner, repoName, tagName)
+			continue
+		}
+
+		log.Printf("      🔍 Helm chart %s for %s/%s %s references %d image(s)", filepath.Base(chartDir), owner, repoName, tagName, len(images))
+		for _, image := range images {
+			if err := postImageSBOMRelease(ctx, image, owner, repoName, release.GitURL, release.GitCommit, isPublic); err != nil {
+				log.Printf("      ⚠️  failed to sync SBOM release for chart image %s (from %s/%s %s): %v", image, owner, repoName, tagName, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -1253,6 +1286,305 @@ func downloadGitHubReleaseJavaArtifactAsset(
 	}
 
 	return assetPath, name, nil
+}
+
+func isHelmChartArchiveAsset(assetName string) bool {
+	n := strings.ToLower(strings.TrimSpace(assetName))
+	return strings.HasSuffix(n, ".tgz") || strings.HasSuffix(n, ".tar.gz")
+}
+
+// downloadGitHubReleaseHelmChartAssets downloads every .tgz/.tar.gz asset
+// attached to a release, extracts each one, and returns the directory of
+// every extracted archive that turns out to actually be a Helm chart (i.e.
+// contains a Chart.yaml). Archives that aren't Helm charts (e.g. a generic
+// build tarball) are extracted then simply skipped -- cheap to check via
+// Chart.yaml, no point guessing from the filename alone.
+func downloadGitHubReleaseHelmChartAssets(
+	ctx context.Context,
+	client *github.Client,
+	owner, repoName string,
+	releaseID int64,
+	ensureTempDir func(prefix string) (string, error),
+) ([]string, error) {
+	assets, _, err := client.Repositories.ListReleaseAssets(ctx, owner, repoName, releaseID, &github.ListOptions{PerPage: 100})
+	if err != nil {
+		return nil, err
+	}
+
+	var archiveAssets []*github.ReleaseAsset
+	for _, asset := range assets {
+		if isHelmChartArchiveAsset(asset.GetName()) {
+			archiveAssets = append(archiveAssets, asset)
+		}
+	}
+	if len(archiveAssets) == 0 {
+		return nil, fmt.Errorf("no .tgz/.tar.gz release asset found")
+	}
+
+	var chartDirs []string
+	for _, asset := range archiveAssets {
+		assetName := asset.GetName()
+
+		rc, _, err := client.Repositories.DownloadReleaseAsset(ctx, owner, repoName, asset.GetID(), http.DefaultClient)
+		if err != nil {
+			log.Printf("      ⚠️  failed to download release asset %s: %v", assetName, err)
+			continue
+		}
+
+		dir, err := ensureTempDir("relscanner-release-asset-*")
+		if err != nil {
+			rc.Close()
+			return chartDirs, err
+		}
+
+		archiveBase := strings.TrimSuffix(strings.TrimSuffix(filepath.Base(assetName), ".tgz"), ".tar.gz")
+		extractDir := filepath.Join(dir, "helm-chart-"+archiveBase)
+
+		extractErr := extractTarGz(rc, extractDir)
+		rc.Close()
+		if extractErr != nil {
+			log.Printf("      ⚠️  failed to extract release asset %s: %v", assetName, extractErr)
+			continue
+		}
+
+		if chartDir, ok := findHelmChartDir(extractDir); ok {
+			chartDirs = append(chartDirs, chartDir)
+		}
+	}
+
+	if len(chartDirs) == 0 {
+		return nil, fmt.Errorf("no Helm chart (Chart.yaml) found in %d .tgz/.tar.gz release asset(s)", len(archiveAssets))
+	}
+	return chartDirs, nil
+}
+
+// extractTarGz extracts a gzip-compressed tar stream to dest, guarding
+// against path traversal ("zip-slip") from malicious archive entries.
+func extractTarGz(r io.Reader, dest string) error {
+	gz, err := gzip.NewReader(r)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	cleanDest := filepath.Clean(dest)
+
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		target := filepath.Join(cleanDest, filepath.Clean(hdr.Name))
+		if target != cleanDest && !strings.HasPrefix(target, cleanDest+string(os.PathSeparator)) {
+			return fmt.Errorf("tar entry %q escapes destination directory", hdr.Name)
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(out, tr); err != nil {
+				out.Close()
+				return err
+			}
+			out.Close()
+		}
+	}
+}
+
+// findHelmChartDir searches an extracted archive for a Chart.yaml and
+// returns the directory containing it -- that directory is the chart root
+// `helm template` should be pointed at, regardless of how deeply the
+// archive nests it (e.g. "<archive>/<chartname>/Chart.yaml").
+func findHelmChartDir(root string) (string, bool) {
+	var found string
+	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || found != "" {
+			return nil
+		}
+		if !d.IsDir() && strings.EqualFold(d.Name(), "Chart.yaml") {
+			found = filepath.Dir(path)
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found, found != ""
+}
+
+// runHelmTemplateImages renders a chart via the Helm Go SDK (the same code
+// path the `helm template` CLI command itself uses) and extracts every
+// container image reference from the rendered manifests. Rendering
+// in-process avoids depending on a `helm` binary being present in the
+// container image.
+func runHelmTemplateImages(chartDir string) ([]string, error) {
+	manifest, err := renderHelmChartManifest(chartDir)
+	if err != nil {
+		return nil, err
+	}
+	return extractImagesFromManifest([]byte(manifest)), nil
+}
+
+// renderHelmChartManifest loads a chart from disk and renders it exactly
+// like `helm template <chartDir>` would -- ClientOnly + DryRun means no
+// Kubernetes cluster is contacted and nothing is installed; Helm just
+// computes default capabilities and coalesces the chart's own values.yaml
+// (no --set/-f overrides, matching plain `helm template` with no extra
+// flags) before executing the chart's templates.
+func renderHelmChartManifest(chartDir string) (string, error) {
+	chartRequested, err := loader.Load(chartDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to load chart %s: %w", chartDir, err)
+	}
+
+	settings := cli.New()
+	actionConfig := new(action.Configuration)
+	// "memory" storage driver + ClientOnly below means no Kubernetes API
+	// calls are ever made -- this stays entirely local.
+	nullLog := func(string, ...interface{}) {}
+	if err := actionConfig.Init(settings.RESTClientGetter(), settings.Namespace(), "memory", nullLog); err != nil {
+		return "", fmt.Errorf("failed to init helm action config for %s: %w", chartDir, err)
+	}
+
+	client := action.NewInstall(actionConfig)
+	client.DryRun = true
+	client.ClientOnly = true
+	client.Replace = true
+	client.IncludeCRDs = true
+	client.ReleaseName = "relscanner-job"
+	client.Namespace = "default"
+	// We're scanning arbitrary third-party charts with no real values file
+	// of our own -- reject only on genuine template failures (missing
+	// `required` values, nil derefs), not on values.schema.json strictness
+	// about fields we were never going to supply.
+	client.DisableOpenAPIValidation = true
+
+	rel, err := client.Run(chartRequested, chartRequested.Values)
+	if err != nil {
+		return "", fmt.Errorf("failed to render chart %s: %w", chartDir, err)
+	}
+	return rel.Manifest, nil
+}
+
+// imageLineRe matches any "image: <ref>" line in rendered Kubernetes YAML,
+// regardless of which Kind or container/initContainer it belongs to.
+var imageLineRe = regexp.MustCompile(`(?m)^\s*-?\s*image:\s*['"]?([^'"\s]+)['"]?\s*$`)
+
+func extractImagesFromManifest(manifest []byte) []string {
+	seen := make(map[string]bool)
+	var images []string
+	for _, m := range imageLineRe.FindAllSubmatch(manifest, -1) {
+		img := string(m[1])
+		if img == "" || seen[img] {
+			continue
+		}
+		seen[img] = true
+		images = append(images, img)
+	}
+	return images
+}
+
+// postImageSBOMRelease builds an SBOM for a container image referenced by a
+// Helm chart (same OCI-attestation -> Cosign -> Syft -> minimal cascade used
+// for every other image SBOM in this scanner) and posts it as its own
+// release, separate from the chart's own source release, so each image gets
+// independent CVE matching.
+func postImageSBOMRelease(ctx context.Context, imageRef, sourceOwner, sourceRepoName, sourceGitURL, sourceCommit string, isPublic bool) error {
+	ref, err := name.ParseReference(imageRef)
+	if err != nil {
+		return fmt.Errorf("invalid image reference %q: %w", imageRef, err)
+	}
+
+	var sbomBytes []byte
+	var dockerSHA string
+
+	if extracted, err := extractSBOMFromImage(imageRef); err == nil {
+		sbomBytes = extracted
+	}
+	if len(sbomBytes) == 0 {
+		generated, sha, err := generateSBOMFromInput(ctx, imageRef)
+		if err == nil {
+			sbomBytes = generated
+			dockerSHA = sha
+		}
+	}
+	if len(sbomBytes) == 0 {
+		sbomBytes = minimalImageSBOM(imageRef)
+	}
+	if dockerSHA == "" {
+		dockerSHA = resolveDockerImageDigest(imageRef)
+	}
+
+	mapping := util.GetDerivedEnvMapping(make(map[string]string))
+	mapping["CompName"] = dockerImageBasename(imageRef)
+	mapping["DockerRepo"] = ref.Context().Name()
+	mapping["DockerTag"] = ref.Identifier()
+	mapping["DockerSha"] = dockerSHA
+	mapping["ProjectType"] = "container"
+	mapping["GitOrg"] = sourceOwner
+	mapping["GitRepoProject"] = sourceRepoName
+	mapping["GitRepo"] = sourceRepoName
+	mapping["GitUrl"] = sourceGitURL
+	mapping["GitCommit"] = sourceCommit
+
+	release := buildRelease(mapping, "container", isPublic)
+	populateContentSha(release)
+
+	sbomObj := model.NewSBOM()
+	sbomObj.Content = json.RawMessage(sbomBytes)
+	req := model.ReleaseWithSBOM{ProjectRelease: *release, SBOM: *sbomObj}
+
+	if err := postRelease(serverURL, req); err != nil {
+		return err
+	}
+
+	log.Printf("      🚀 Chart image release %s synced (SHA: %s)", imageRef, release.ContentSha)
+	return nil
+}
+
+// minimalImageSBOM is the last-resort SBOM for a chart-referenced image when
+// no OCI attestation/Cosign signature is found and Syft can't reach or scan
+// it -- mirrors minimalCycloneDXSBOM's shape but with an OCI purl instead of
+// a GitHub one, since this component is an image, not a git repo.
+func minimalImageSBOM(imageRef string) []byte {
+	imgName := dockerImageBasename(imageRef)
+	imgTag := ""
+	if ref, err := name.ParseReference(imageRef); err == nil {
+		imgTag = ref.Identifier()
+	}
+	purl := fmt.Sprintf("pkg:oci/%s@%s", imgName, imgTag)
+
+	bom := map[string]interface{}{
+		"bomFormat":   "CycloneDX",
+		"specVersion": "1.5",
+		"metadata": map[string]interface{}{
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"component": map[string]interface{}{
+				"type":    "container",
+				"name":    imgName,
+				"version": imgTag,
+				"purl":    purl,
+				"bom-ref": purl,
+			},
+		},
+		"components": []interface{}{},
+	}
+
+	out, _ := json.Marshal(bom)
+	return out
 }
 
 func resolveGitHubReleaseCommit(ctx context.Context, client *github.Client, owner, repoName, tagName string) (string, error) {
