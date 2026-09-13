@@ -1947,7 +1947,27 @@ func isCCppRepo(root string) bool {
 			return nil
 		}
 
-		lang := enry.GetLanguage(path, content)
+		// enry.GetLanguage silently falls back to picking the alphabetically
+		// first candidate whenever an extension is ambiguous and the content
+		// classifier can't confidently pick between them -- it never reports
+		// that the guess was a coin flip. That's exactly what happens for
+		// DeployHub-Pro's own ".re" procedure/recipe scripts: ".re" is
+		// shared between C++ and Reason in go-enry's extension table, their
+		// content doesn't read like either, and "C++" sorts before "Reason"
+		// alphabetically -- so every one of those non-C++ files silently
+		// counted as a C++ hit, which alone was enough to trip cppCount >= 3
+		// and route the whole release through the C/C++ (cdxgen) SBOM path
+		// instead of Syft. Use the safe/unsafe flag explicitly: an
+		// extension match is trusted outright only if it's unambiguous;
+		// otherwise the content classifier has to independently confirm
+		// C/C++/Objective-C with confidence, not just win a tiebreak.
+		lang, safe := enry.GetLanguageByExtension(path)
+		if !safe {
+			lang, safe = enry.GetLanguageByContent(path, content)
+		}
+		if !safe {
+			return nil
+		}
 		if _, ok := counts[lang]; ok {
 			counts[lang]++
 		}
