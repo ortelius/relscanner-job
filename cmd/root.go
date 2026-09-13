@@ -154,6 +154,19 @@ type ScannerState struct {
 	// VisitedThisRun is not persisted — used to deduplicate repos that appear
 	// in both org tracked_repos (Pass 2) and system_tracked_repos (Pass 3).
 	VisitedThisRun map[string]bool `json:"-"`
+
+	// TouchedRepos/TouchedReleases record exactly which ProcessedRepos /
+	// ProcessedReleases keys THIS run actually wrote to. saveScannerState
+	// uses these to merge only those keys into a freshly-read copy of the
+	// persisted document, instead of blindly overwriting the whole
+	// processed_repos/processed_releases map with whatever this run loaded
+	// at startup. Without this, a long-running scan (hundreds of repos, can
+	// take many minutes) that started before an external reset/manual DB
+	// edit -- or before a separate concurrent run finished -- would silently
+	// stomp that change back out when it finally calls saveScannerState at
+	// the end, since its in-memory map still has the old, pre-reset entry.
+	TouchedRepos    map[string]bool `json:"-"`
+	TouchedReleases map[string]bool `json:"-"`
 }
 
 func newScannerState() *ScannerState {
@@ -161,6 +174,8 @@ func newScannerState() *ScannerState {
 		Key:               "relscanner_state",
 		ProcessedRepos:    make(map[string]int64),
 		ProcessedReleases: make(map[string]ReleaseScanState),
+		TouchedRepos:      make(map[string]bool),
+		TouchedReleases:   make(map[string]bool),
 	}
 }
 
@@ -184,6 +199,8 @@ func loadScannerState(ctx context.Context, dbConn *database.DBConnection) (*Scan
 		if state.ProcessedReleases == nil {
 			state.ProcessedReleases = make(map[string]ReleaseScanState)
 		}
+		state.TouchedRepos = make(map[string]bool)
+		state.TouchedReleases = make(map[string]bool)
 		return &state, nil
 	}
 	return newScannerState(), nil
@@ -200,24 +217,47 @@ func saveScannerState(ctx context.Context, dbConn *database.DBConnection, state 
 		state.ProcessedReleases = make(map[string]ReleaseScanState)
 	}
 
+	// Only write back the keys THIS run actually touched. A full scan across
+	// every tracked repo can take a long time, so state loaded at the start
+	// of the run can be stale by the time we get here -- another concurrent
+	// run finishing, or someone manually editing/resetting an entry in
+	// metadata/relscanner_state mid-run, would otherwise get silently undone
+	// by blindly writing back this run's full in-memory copy. Merging just
+	// the touched keys against a freshly-read document (in the same AQL
+	// query, so there's no separate read-then-write round trip) means
+	// untouched keys -- including ones changed out from under us -- survive.
+	repoUpdates := make(map[string]int64, len(state.TouchedRepos))
+	for key := range state.TouchedRepos {
+		repoUpdates[key] = state.ProcessedRepos[key]
+	}
+	releaseUpdates := make(map[string]ReleaseScanState, len(state.TouchedReleases))
+	for key := range state.TouchedReleases {
+		releaseUpdates[key] = state.ProcessedReleases[key]
+	}
+
 	query := `
+		LET current = DOCUMENT("metadata/relscanner_state")
+		LET currentRepos = current != null && current.processed_repos != null ? current.processed_repos : {}
+		LET currentReleases = current != null && current.processed_releases != null ? current.processed_releases : {}
+		LET mergedRepos = MERGE(currentRepos, @repoUpdates)
+		LET mergedReleases = MERGE(currentReleases, @releaseUpdates)
 		UPSERT { _key: "relscanner_state" }
 		INSERT {
 			_key: "relscanner_state",
-			processed_repos: @processedRepos,
-			processed_releases: @processedReleases,
+			processed_repos: mergedRepos,
+			processed_releases: mergedReleases,
 			last_scanned_at: DATE_ISO8601(DATE_NOW())
 		}
 		UPDATE {
-			processed_repos: @processedRepos,
-			processed_releases: @processedReleases,
+			processed_repos: mergedRepos,
+			processed_releases: mergedReleases,
 			last_scanned_at: DATE_ISO8601(DATE_NOW())
 		}
 		IN metadata
 	`
 	bindVars := map[string]interface{}{
-		"processedRepos":    state.ProcessedRepos,
-		"processedReleases": state.ProcessedReleases,
+		"repoUpdates":    repoUpdates,
+		"releaseUpdates": releaseUpdates,
 	}
 	_, err := dbConn.Database.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars})
 	return err
@@ -472,7 +512,7 @@ func processTrackedGitHubRepo(ctx context.Context, dbConn database.DBConnection,
 		return nil
 	}
 
-	if err := processSingleRepo(ctx, client, token, owner, repoName, isPublic, state.ProcessedRepos); err != nil {
+	if err := processSingleRepo(ctx, client, token, owner, repoName, isPublic, state.ProcessedRepos, state.TouchedRepos); err != nil {
 		log.Printf("      ⚠️  workflow scan skipped for %s/%s: %v", owner, repoName, err)
 	}
 
@@ -497,7 +537,7 @@ func processUserInstallation(ctx context.Context, dbConn database.DBConnection, 
 		}
 		for _, repo := range repos.Repositories {
 			if !repo.GetArchived() {
-				if err := processSingleRepo(ctx, client, token, repo.GetOwner().GetLogin(), repo.GetName(), !repo.GetPrivate(), state.ProcessedRepos); err != nil {
+				if err := processSingleRepo(ctx, client, token, repo.GetOwner().GetLogin(), repo.GetName(), !repo.GetPrivate(), state.ProcessedRepos, state.TouchedRepos); err != nil {
 					log.Printf("      ⚠️  workflow scan skipped for %s/%s: %v", repo.GetOwner().GetLogin(), repo.GetName(), err)
 				}
 				if err := processGitHubSourceReleases(ctx, dbConn, client, token, repo.GetOwner().GetLogin(), repo.GetName(), !repo.GetPrivate(), state); err != nil {
@@ -513,7 +553,7 @@ func processUserInstallation(ctx context.Context, dbConn database.DBConnection, 
 	return nil
 }
 
-func processSingleRepo(ctx context.Context, client *github.Client, token, owner, repoName string, isPublic bool, processedRepos map[string]int64) error {
+func processSingleRepo(ctx context.Context, client *github.Client, token, owner, repoName string, isPublic bool, processedRepos map[string]int64, touchedRepos map[string]bool) error {
 	repoKey := fmt.Sprintf("github/%s/%s", owner, repoName)
 	lastProcessedID := processedRepos[repoKey]
 
@@ -522,6 +562,7 @@ func processSingleRepo(ctx context.Context, client *github.Client, token, owner,
 	if err != nil {
 		if highestSeenID > processedRepos[repoKey] {
 			processedRepos[repoKey] = highestSeenID
+			touchedRepos[repoKey] = true
 			log.Printf("      ⏭️  No actionable runs for %s/%s; checkpointing at run %d", owner, repoName, highestSeenID)
 		}
 		return err
@@ -536,7 +577,7 @@ func processSingleRepo(ctx context.Context, client *github.Client, token, owner,
 			continue
 		}
 
-		if err := processWorkflowScanTarget(ctx, client, token, owner, repoName, isPublic, processedRepos, target); err != nil {
+		if err := processWorkflowScanTarget(ctx, client, token, owner, repoName, isPublic, processedRepos, touchedRepos, target); err != nil {
 			lastErr = err
 			log.Printf("      ⚠️  workflow run %s/%s %d failed: %v", owner, repoName, target.RunID, err)
 			continue
@@ -552,6 +593,7 @@ func processSingleRepo(ctx context.Context, client *github.Client, token, owner,
 	// where per-target processing put it so that target retries next cycle.
 	if lastErr == nil && highestSeenID > processedRepos[repoKey] {
 		processedRepos[repoKey] = highestSeenID
+		touchedRepos[repoKey] = true
 	}
 
 	if !processedAny && lastErr != nil {
@@ -569,6 +611,7 @@ func processWorkflowScanTarget(
 	repoName string,
 	isPublic bool,
 	processedRepos map[string]int64,
+	touchedRepos map[string]bool,
 	target WorkflowScanTarget,
 ) error {
 	runID := target.RunID
@@ -609,6 +652,7 @@ func processWorkflowScanTarget(
 	if releaseVersion == "0.0.0-snapshot" {
 		log.Printf("      ⏭️  skipping workflow run %s/%s %d: no tagged release/docker tag found (untagged CI scan, not ingested)", owner, repoName, runID)
 		processedRepos[repoKey] = runID
+		touchedRepos[repoKey] = true
 		return nil
 	}
 
@@ -731,6 +775,7 @@ func processWorkflowScanTarget(
 	}
 
 	processedRepos[repoKey] = runID
+	touchedRepos[repoKey] = true
 	log.Printf("      🚀 Release %s synced (SHA: %s)", releaseVersion, release.ContentSha)
 
 	return nil
@@ -860,7 +905,7 @@ func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnecti
 	// composite-key dedup and CreateOrUpdateLifecycleRecord's existing-record
 	// check.
 	const newRepoMaxReleases = 5
-	const backfillMaxReleases = 99
+	const backfillMaxReleases = 10
 
 	if state.ProcessedReleases == nil {
 		state.ProcessedReleases = make(map[string]ReleaseScanState)
@@ -910,7 +955,15 @@ func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnecti
 		opt.Page = resp.NextPage
 	}
 
-	sort.Slice(pending, func(i, j int) bool { return pending[i].GetID() < pending[j].GetID() })
+	// Newest-first: with a large backfill (or a watermark that just got
+	// rewound way back by resetWatermarkOnGap), pending can be bigger than
+	// what one run can comfortably get through before it's killed/rate
+	// limited. Processing oldest-first risked the newest release -- the one
+	// people actually look at -- always being last in line and never
+	// getting reached. Processing newest-first guarantees the latest
+	// release gets its SBOM synced first; older gaps still get backfilled,
+	// just over however many runs it takes.
+	sort.Slice(pending, func(i, j int) bool { return pending[i].GetID() > pending[j].GetID() })
 
 	for _, ghRelease := range pending {
 		if err := processGitHubSourceRelease(ctx, client, token, owner, repoName, ghRelease, isPublic); err != nil {
@@ -918,14 +971,23 @@ func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnecti
 			continue
 		}
 
+		// Only ever advance the watermark. Now that pending is processed
+		// newest-first, a later (older) release succeeding after an
+		// earlier (newer) one must not drag LastReleaseID backwards.
+		if ghRelease.GetID() <= lastState.LastReleaseID {
+			continue
+		}
+
 		version := releaseVersionFromGitHubRelease(owner, repoName, ghRelease)
-		state.ProcessedReleases[repoKey] = ReleaseScanState{
+		lastState = ReleaseScanState{
 			LastReleaseID:   ghRelease.GetID(),
 			LastPublishedAt: githubTimestampToString(ghRelease.GetPublishedAt()),
 			LastTag:         ghRelease.GetTagName(),
 			LastVersion:     version,
 			LastScannedAt:   time.Now().UTC().Format(time.RFC3339),
 		}
+		state.ProcessedReleases[repoKey] = lastState
+		state.TouchedReleases[repoKey] = true
 	}
 
 	return nil
@@ -1539,7 +1601,21 @@ func postImageSBOMRelease(ctx context.Context, imageRef, sourceOwner, sourceRepo
 	}
 
 	mapping := util.GetDerivedEnvMapping(make(map[string]string))
-	mapping["CompName"] = dockerImageBasename(imageRef)
+	// CompName must carry the "org/name" shape every other release in this
+	// file uses (see processGitHubSourceRelease / processWorkflowScanTarget:
+	// CompName = "owner/repo"). It's tempting to use the chart's own
+	// sourceOwner for the org half, but that's wrong: a single chart
+	// (owned by e.g. DeployHubProject) legitimately references images
+	// published under several different orgs (quay.io/ortelius/..,
+	// quay.io/deployhub/..). The org half has to come from the image's OWN
+	// registry namespace, not the chart repo that happens to reference it
+	// -- falling back to sourceOwner only if the image ref genuinely has no
+	// separable namespace of its own.
+	imgOrg := dockerImageOrg(imageRef)
+	if imgOrg == "" {
+		imgOrg = sourceOwner
+	}
+	mapping["CompName"] = fmt.Sprintf("%s/%s", imgOrg, dockerImageBasename(imageRef))
 	mapping["DockerRepo"] = ref.Context().Name()
 	mapping["DockerTag"] = ref.Identifier()
 	mapping["DockerSha"] = dockerSHA
@@ -1809,6 +1885,29 @@ func dockerImageBasename(imageRef string) string {
 
 	parts := strings.Split(repo, "/")
 	return parts[len(parts)-1]
+}
+
+// dockerImageOrg returns the namespace/org segment of an image's own
+// registry path -- e.g. "ortelius" for quay.io/ortelius/ms-foo, "deployhub"
+// for quay.io/deployhub/ms-bar, "library" for a bare Docker Hub image like
+// postgres:12 (index.docker.io/library/postgres). This is the image's own
+// publishing org, which is NOT necessarily the same as the source repo/chart
+// that references it -- a chart owned by DeployHubProject can (and does)
+// reference images published under both ortelius and deployhub. Falls back
+// to the empty string if the ref has no separable namespace segment at all
+// (single-segment RepositoryStr, which name.ParseReference shouldn't
+// normally produce since it always resolves a default namespace).
+func dockerImageOrg(imageRef string) string {
+	ref, err := name.ParseReference(imageRef)
+	if err != nil {
+		return ""
+	}
+
+	repo := ref.Context().RepositoryStr()
+	if idx := strings.LastIndex(repo, "/"); idx != -1 {
+		return repo[:idx]
+	}
+	return ""
 }
 
 // -------------------- EXISTING HELPERS --------------------
