@@ -807,6 +807,32 @@ func getKnownReleaseVersions(ctx context.Context, dbConn database.DBConnection, 
 	return known, nil
 }
 
+// releaseVersionExists is a cheap idempotency guard, meant to be called
+// before any of the expensive work (git clone, docker pull, Syft/cdxgen
+// scan, cosign/OCI attestation lookups) that goes into building a release.
+// It hits the DB directly rather than relying on the in-memory
+// ScannerState watermark, because the watermark only gets persisted once,
+// at the very end of a whole run (see saveScannerState) -- a crash,
+// OOMKill, or manual state reset loses it, but the actual release sitting
+// in the DB is the real source of truth for "has this already been done."
+// Without this, every one of these interruptions turns into redoing a full
+// image/source scan that had already succeeded and was already recorded
+// server-side, for no benefit.
+func releaseVersionExists(ctx context.Context, dbConn database.DBConnection, releaseName, version string) (bool, error) {
+	if releaseName == "" || version == "" {
+		return false, nil
+	}
+	query := `FOR r IN release FILTER r.name == @name && r.version == @version LIMIT 1 RETURN 1`
+	cursor, err := dbConn.Database.Query(ctx, query, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{"name": releaseName, "version": version},
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to check existing release %s %s: %w", releaseName, version, err)
+	}
+	defer cursor.Close()
+	return cursor.HasMore(), nil
+}
+
 // findEarliestMissingReleaseID scans a repo's GitHub releases (newest-first,
 // GitHub's default order) looking for gaps at or below the current watermark
 // — releases that were silently skipped by the old high-water-mark bug.
@@ -966,7 +992,7 @@ func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnecti
 	sort.Slice(pending, func(i, j int) bool { return pending[i].GetID() > pending[j].GetID() })
 
 	for _, ghRelease := range pending {
-		if err := processGitHubSourceRelease(ctx, client, token, owner, repoName, ghRelease, isPublic); err != nil {
+		if err := processGitHubSourceRelease(ctx, dbConn, client, token, owner, repoName, ghRelease, isPublic); err != nil {
 			log.Printf("      ⚠️  source release %s/%s %s failed: %v", owner, repoName, ghRelease.GetTagName(), err)
 			continue
 		}
@@ -993,11 +1019,19 @@ func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnecti
 	return nil
 }
 
-func processGitHubSourceRelease(ctx context.Context, client *github.Client, token, owner, repoName string, ghRelease *github.RepositoryRelease, isPublic bool) error {
+func processGitHubSourceRelease(ctx context.Context, dbConn database.DBConnection, client *github.Client, token, owner, repoName string, ghRelease *github.RepositoryRelease, isPublic bool) error {
 	tagName := ghRelease.GetTagName()
 	version := releaseVersionFromGitHubRelease(owner, repoName, ghRelease)
 	if version == "" {
 		version = tagName
+	}
+
+	releaseName := fmt.Sprintf("%s/%s", owner, repoName)
+	sourceExists := false
+	if exists, err := releaseVersionExists(ctx, dbConn, releaseName, version); err != nil {
+		log.Printf("      ⚠️  failed to check existing release for %s %s: %v", releaseName, version, err)
+	} else {
+		sourceExists = exists
 	}
 
 	var sbomBytes []byte
@@ -1062,115 +1096,128 @@ func processGitHubSourceRelease(ctx context.Context, client *github.Client, toke
 		}
 	}
 
-	if downloaded, err := downloadGitHubReleaseSBOMAsset(ctx, client, owner, repoName, ghRelease.GetID()); err == nil && len(downloaded) > 0 {
-		if cleaned, cleanErr := cleanupCycloneDXMainComponent(downloaded, owner, repoName, version); cleanErr == nil {
-			sbomBytes = cleaned
-		} else {
-			sbomBytes = downloaded
-			log.Printf("      ⚠️  release SBOM asset found but CycloneDX metadata.component cleanup failed: %v", cleanErr)
-		}
-		log.Printf("      ✅ Found SBOM release asset for %s/%s %s", owner, repoName, tagName)
-		resolveCommitViaAPI()
-	} else if err != nil {
-		log.Printf("      ℹ️  No SBOM release asset for %s/%s %s: %v", owner, repoName, tagName, err)
-	}
+	gitURL := fmt.Sprintf("https://github.com/%s/%s", owner, repoName)
 
-	if len(sbomBytes) == 0 {
-		assetPath, assetName, err := downloadGitHubReleaseJavaArtifactAsset(ctx, client, owner, repoName, ghRelease.GetID(), ensureTempDir)
-		if err == nil && assetPath != "" {
-			generated, _, genErr := generateSBOMFromInput(ctx, assetPath)
-			if genErr != nil {
-				log.Printf("      ⚠️  Syft Java artifact SBOM generation failed for %s/%s %s asset %s: %v", owner, repoName, tagName, assetName, genErr)
-			} else if cleaned, cleanErr := cleanupCycloneDXMainComponent(generated, owner, repoName, version); cleanErr != nil {
-				log.Printf("      ⚠️  Java artifact SBOM generated but metadata.component cleanup failed: %v", cleanErr)
-				sbomBytes = generated
-			} else {
+	if sourceExists {
+		// Already fully processed and posted in a prior run -- skip the
+		// entire SBOM cascade (asset download, Java artifact scan, full git
+		// clone + Syft/cdxgen) entirely. Chart images still get checked
+		// individually below, since a prior run could have died partway
+		// through the image batch even after the source release itself
+		// posted successfully.
+		log.Printf("      ⏭️  Source release %s/%s %s already exists, skipping SBOM generation", owner, repoName, version)
+		resolveCommitViaAPI()
+	} else {
+		if downloaded, err := downloadGitHubReleaseSBOMAsset(ctx, client, owner, repoName, ghRelease.GetID()); err == nil && len(downloaded) > 0 {
+			if cleaned, cleanErr := cleanupCycloneDXMainComponent(downloaded, owner, repoName, version); cleanErr == nil {
 				sbomBytes = cleaned
-				log.Printf("      ✅ Generated Java artifact SBOM with Syft for %s/%s %s from %s", owner, repoName, tagName, assetName)
+			} else {
+				sbomBytes = downloaded
+				log.Printf("      ⚠️  release SBOM asset found but CycloneDX metadata.component cleanup failed: %v", cleanErr)
 			}
+			log.Printf("      ✅ Found SBOM release asset for %s/%s %s", owner, repoName, tagName)
 			resolveCommitViaAPI()
 		} else if err != nil {
-			log.Printf("      ℹ️  No Java release artifact for %s/%s %s: %v", owner, repoName, tagName, err)
+			log.Printf("      ℹ️  No SBOM release asset for %s/%s %s: %v", owner, repoName, tagName, err)
 		}
-	}
 
-	if len(sbomBytes) == 0 {
+		if len(sbomBytes) == 0 {
+			assetPath, assetName, err := downloadGitHubReleaseJavaArtifactAsset(ctx, client, owner, repoName, ghRelease.GetID(), ensureTempDir)
+			if err == nil && assetPath != "" {
+				generated, _, genErr := generateSBOMFromInput(ctx, assetPath)
+				if genErr != nil {
+					log.Printf("      ⚠️  Syft Java artifact SBOM generation failed for %s/%s %s asset %s: %v", owner, repoName, tagName, assetName, genErr)
+				} else if cleaned, cleanErr := cleanupCycloneDXMainComponent(generated, owner, repoName, version); cleanErr != nil {
+					log.Printf("      ⚠️  Java artifact SBOM generated but metadata.component cleanup failed: %v", cleanErr)
+					sbomBytes = generated
+				} else {
+					sbomBytes = cleaned
+					log.Printf("      ✅ Generated Java artifact SBOM with Syft for %s/%s %s from %s", owner, repoName, tagName, assetName)
+				}
+				resolveCommitViaAPI()
+			} else if err != nil {
+				log.Printf("      ℹ️  No Java release artifact for %s/%s %s: %v", owner, repoName, tagName, err)
+			}
+		}
+
+		if len(sbomBytes) == 0 {
+			if err := ensureCheckout(); err != nil {
+				return err
+			}
+
+			if isCCppRepo(tempDir) {
+				generated, err := generateCdxgenSBOM(tempDir)
+				if err != nil {
+					log.Printf("      ⚠️  cdxgen C/C++ SBOM generation failed for %s/%s %s: %v", owner, repoName, tagName, err)
+				} else if cleaned, cleanErr := cleanupCycloneDXMainComponent(generated, owner, repoName, version); cleanErr != nil {
+					log.Printf("      ⚠️  cdxgen SBOM generated but metadata.component cleanup failed: %v", cleanErr)
+					sbomBytes = generated
+				} else {
+					sbomBytes = cleaned
+					log.Printf("      ✅ Generated C/C++ SBOM with cdxgen for %s/%s %s", owner, repoName, tagName)
+				}
+			} else {
+				generated, _, err := generateSBOMFromInput(ctx, tempDir)
+				if err != nil {
+					log.Printf("      ⚠️  Syft source SBOM generation failed for %s/%s %s: %v", owner, repoName, tagName, err)
+				} else if cleaned, cleanErr := cleanupCycloneDXMainComponent(generated, owner, repoName, version); cleanErr != nil {
+					log.Printf("      ⚠️  Syft SBOM generated but metadata.component cleanup failed: %v", cleanErr)
+					sbomBytes = generated
+				} else {
+					sbomBytes = cleaned
+					log.Printf("      ✅ Generated source SBOM with Syft for %s/%s %s", owner, repoName, tagName)
+				}
+			}
+		}
+
 		if err := ensureCheckout(); err != nil {
 			return err
 		}
 
-		if isCCppRepo(tempDir) {
-			generated, err := generateCdxgenSBOM(tempDir)
-			if err != nil {
-				log.Printf("      ⚠️  cdxgen C/C++ SBOM generation failed for %s/%s %s: %v", owner, repoName, tagName, err)
-			} else if cleaned, cleanErr := cleanupCycloneDXMainComponent(generated, owner, repoName, version); cleanErr != nil {
-				log.Printf("      ⚠️  cdxgen SBOM generated but metadata.component cleanup failed: %v", cleanErr)
-				sbomBytes = generated
-			} else {
-				sbomBytes = cleaned
-				log.Printf("      ✅ Generated C/C++ SBOM with cdxgen for %s/%s %s", owner, repoName, tagName)
-			}
-		} else {
-			generated, _, err := generateSBOMFromInput(ctx, tempDir)
-			if err != nil {
-				log.Printf("      ⚠️  Syft source SBOM generation failed for %s/%s %s: %v", owner, repoName, tagName, err)
-			} else if cleaned, cleanErr := cleanupCycloneDXMainComponent(generated, owner, repoName, version); cleanErr != nil {
-				log.Printf("      ⚠️  Syft SBOM generated but metadata.component cleanup failed: %v", cleanErr)
-				sbomBytes = generated
-			} else {
-				sbomBytes = cleaned
-				log.Printf("      ✅ Generated source SBOM with Syft for %s/%s %s", owner, repoName, tagName)
-			}
+		if len(sbomBytes) == 0 {
+			sbomBytes = minimalCycloneDXSBOM(owner, repoName, version)
 		}
+
+		mapping := util.GetDerivedEnvMapping(make(map[string]string))
+		mapping["CompName"] = releaseName
+		mapping["GitRepoProject"] = repoName
+		mapping["GitRepo"] = repoName
+		mapping["GitOrg"] = owner
+		mapping["GitCommit"] = commitSHA
+		mapping["GitBranch"] = ghRelease.GetTargetCommitish()
+		mapping["GitTag"] = tagName
+		mapping["GitVersion"] = version
+		mapping["BuildId"] = fmt.Sprintf("%d", ghRelease.GetID())
+		mapping["BuildNumber"] = fmt.Sprintf("%d", ghRelease.GetID())
+		mapping["BuildUrl"] = ghRelease.GetHTMLURL()
+		mapping["BuildDate"] = githubTimestampToString(ghRelease.GetPublishedAt())
+		mapping["GitUrl"] = gitURL
+		mapping["ProjectType"] = "application"
+
+		if commitSHA != "" {
+			gitMeta := collectGitScanMetadata(tempDir, commitSHA)
+			applyGitScanMetadata(mapping, gitMeta)
+		}
+
+		release := buildRelease(mapping, "application", isPublic)
+		populateContentSha(release)
+
+		scorecardResult, aggregateScore, err := fetchOpenSSFScorecard(release.GitURL, release.GitCommit)
+		if err == nil {
+			release.ScorecardResult = scorecardResult
+			release.OpenSSFScorecardScore = aggregateScore
+		}
+
+		sbomObj := model.NewSBOM()
+		sbomObj.Content = json.RawMessage(sbomBytes)
+		req := model.ReleaseWithSBOM{ProjectRelease: *release, SBOM: *sbomObj}
+
+		if err := postRelease(serverURL, req); err != nil {
+			return err
+		}
+
+		log.Printf("      🚀 Source release %s/%s %s synced (SHA: %s)", owner, repoName, version, release.ContentSha)
 	}
-
-	if err := ensureCheckout(); err != nil {
-		return err
-	}
-
-	if len(sbomBytes) == 0 {
-		sbomBytes = minimalCycloneDXSBOM(owner, repoName, version)
-	}
-
-	mapping := util.GetDerivedEnvMapping(make(map[string]string))
-	mapping["CompName"] = fmt.Sprintf("%s/%s", owner, repoName)
-	mapping["GitRepoProject"] = repoName
-	mapping["GitRepo"] = repoName
-	mapping["GitOrg"] = owner
-	mapping["GitCommit"] = commitSHA
-	mapping["GitBranch"] = ghRelease.GetTargetCommitish()
-	mapping["GitTag"] = tagName
-	mapping["GitVersion"] = version
-	mapping["BuildId"] = fmt.Sprintf("%d", ghRelease.GetID())
-	mapping["BuildNumber"] = fmt.Sprintf("%d", ghRelease.GetID())
-	mapping["BuildUrl"] = ghRelease.GetHTMLURL()
-	mapping["BuildDate"] = githubTimestampToString(ghRelease.GetPublishedAt())
-	mapping["GitUrl"] = fmt.Sprintf("https://github.com/%s/%s", owner, repoName)
-	mapping["ProjectType"] = "application"
-
-	if commitSHA != "" {
-		gitMeta := collectGitScanMetadata(tempDir, commitSHA)
-		applyGitScanMetadata(mapping, gitMeta)
-	}
-
-	release := buildRelease(mapping, "application", isPublic)
-	populateContentSha(release)
-
-	scorecardResult, aggregateScore, err := fetchOpenSSFScorecard(release.GitURL, release.GitCommit)
-	if err == nil {
-		release.ScorecardResult = scorecardResult
-		release.OpenSSFScorecardScore = aggregateScore
-	}
-
-	sbomObj := model.NewSBOM()
-	sbomObj.Content = json.RawMessage(sbomBytes)
-	req := model.ReleaseWithSBOM{ProjectRelease: *release, SBOM: *sbomObj}
-
-	if err := postRelease(serverURL, req); err != nil {
-		return err
-	}
-
-	log.Printf("      🚀 Source release %s/%s %s synced (SHA: %s)", owner, repoName, version, release.ContentSha)
 
 	chartDirs, chartErr := downloadGitHubReleaseHelmChartAssets(ctx, client, owner, repoName, ghRelease.GetID(), ensureTempDir)
 	if chartErr != nil {
@@ -1191,7 +1238,7 @@ func processGitHubSourceRelease(ctx context.Context, client *github.Client, toke
 
 		log.Printf("      🔍 Helm chart %s for %s/%s %s references %d image(s)", filepath.Base(chartDir), owner, repoName, tagName, len(images))
 		for _, image := range images {
-			if err := postImageSBOMRelease(ctx, image, owner, repoName, release.GitURL, release.GitCommit, isPublic); err != nil {
+			if err := postImageSBOMRelease(ctx, dbConn, image, owner, repoName, gitURL, commitSHA, isPublic); err != nil {
 				log.Printf("      ⚠️  failed to sync SBOM release for chart image %s (from %s/%s %s): %v", image, owner, repoName, tagName, err)
 			}
 		}
@@ -1574,10 +1621,42 @@ func extractImagesFromManifest(manifest []byte) []string {
 // for every other image SBOM in this scanner) and posts it as its own
 // release, separate from the chart's own source release, so each image gets
 // independent CVE matching.
-func postImageSBOMRelease(ctx context.Context, imageRef, sourceOwner, sourceRepoName, sourceGitURL, sourceCommit string, isPublic bool) error {
+func postImageSBOMRelease(ctx context.Context, dbConn database.DBConnection, imageRef, sourceOwner, sourceRepoName, sourceGitURL, sourceCommit string, isPublic bool) error {
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
 		return fmt.Errorf("invalid image reference %q: %w", imageRef, err)
+	}
+
+	// CompName must carry the "org/name" shape every other release in this
+	// file uses (see processGitHubSourceRelease / processWorkflowScanTarget:
+	// CompName = "owner/repo"). It's tempting to use the chart's own
+	// sourceOwner for the org half, but that's wrong: a single chart
+	// (owned by e.g. DeployHubProject) legitimately references images
+	// published under several different orgs (quay.io/ortelius/..,
+	// quay.io/deployhub/..). The org half has to come from the image's OWN
+	// registry namespace, not the chart repo that happens to reference it
+	// -- falling back to sourceOwner only if the image ref genuinely has no
+	// separable namespace of its own.
+	imgOrg := dockerImageOrg(imageRef)
+	if imgOrg == "" {
+		imgOrg = sourceOwner
+	}
+	compName := fmt.Sprintf("%s/%s", imgOrg, dockerImageBasename(imageRef))
+	dockerTag := ref.Identifier()
+
+	// Cheap DB check before any of the expensive work below (docker pull,
+	// Syft/cdxgen scan, cosign/OCI attestation lookups). A chart can
+	// reference 10+ images per release; without this, every 15-minute scan
+	// redid every image's full pull-and-scan even though nothing about that
+	// image/tag had changed since the last successful sync -- and if the
+	// process gets OOMKilled partway through a batch (as this one has been),
+	// the images already synced before the crash get redone too, since the
+	// in-memory watermark for that never made it to a save point.
+	if exists, err := releaseVersionExists(ctx, dbConn, compName, dockerTag); err != nil {
+		log.Printf("      ⚠️  failed to check existing release for %s %s: %v", compName, dockerTag, err)
+	} else if exists {
+		log.Printf("      ⏭️  Chart image release %s already exists, skipping", imageRef)
+		return nil
 	}
 
 	var sbomBytes []byte
@@ -1601,23 +1680,9 @@ func postImageSBOMRelease(ctx context.Context, imageRef, sourceOwner, sourceRepo
 	}
 
 	mapping := util.GetDerivedEnvMapping(make(map[string]string))
-	// CompName must carry the "org/name" shape every other release in this
-	// file uses (see processGitHubSourceRelease / processWorkflowScanTarget:
-	// CompName = "owner/repo"). It's tempting to use the chart's own
-	// sourceOwner for the org half, but that's wrong: a single chart
-	// (owned by e.g. DeployHubProject) legitimately references images
-	// published under several different orgs (quay.io/ortelius/..,
-	// quay.io/deployhub/..). The org half has to come from the image's OWN
-	// registry namespace, not the chart repo that happens to reference it
-	// -- falling back to sourceOwner only if the image ref genuinely has no
-	// separable namespace of its own.
-	imgOrg := dockerImageOrg(imageRef)
-	if imgOrg == "" {
-		imgOrg = sourceOwner
-	}
-	mapping["CompName"] = fmt.Sprintf("%s/%s", imgOrg, dockerImageBasename(imageRef))
+	mapping["CompName"] = compName
 	mapping["DockerRepo"] = ref.Context().Name()
-	mapping["DockerTag"] = ref.Identifier()
+	mapping["DockerTag"] = dockerTag
 	mapping["DockerSha"] = dockerSHA
 	mapping["ProjectType"] = "container"
 	mapping["GitOrg"] = sourceOwner
@@ -2180,9 +2245,24 @@ func findLatestRelevantRuns(ctx context.Context, client *github.Client, owner, r
 	return targets, safeWatermark, nil
 }
 
+// errWorkflowLogsExpired marks a fetchAndAnalyzeRun failure as GitHub having
+// permanently discarded a workflow run's logs (410 Gone). Needed because
+// client.Actions.GetWorkflowRunLogs returns this specific failure as a bare
+// fmt.Errorf("unexpected status code: %v", ...) — not the typed
+// *github.ErrorResponse isExpiredWorkflowLogs otherwise checks for — even
+// though the real HTTP response (with the actual status code) is sitting
+// right there in the discarded second return value. Without wrapping it
+// here, isExpiredWorkflowLogs can never structurally match this case, and a
+// run whose logs expired retries every single scan cycle, forever, with no
+// way to ever succeed.
+var errWorkflowLogsExpired = errors.New("workflow run logs expired")
+
 func fetchAndAnalyzeRun(ctx context.Context, client *github.Client, owner, repo string, runID int64) (*LogAnalysis, error) {
 	url, resp, err := client.Actions.GetWorkflowRunLogs(ctx, owner, repo, runID, 3)
 	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusGone {
+			return nil, fmt.Errorf("%w: %v", errWorkflowLogsExpired, err)
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -2195,6 +2275,9 @@ func fetchAndAnalyzeRun(ctx context.Context, client *github.Client, owner, repo 
 // Gone). This is permanent -- the logs are never coming back -- unlike
 // network blips or rate limiting, which should still be retried next cycle.
 func isExpiredWorkflowLogs(err error) bool {
+	if errors.Is(err, errWorkflowLogsExpired) {
+		return true
+	}
 	var ghErr *github.ErrorResponse
 	if errors.As(err, &ghErr) && ghErr.Response != nil {
 		return ghErr.Response.StatusCode == http.StatusGone
