@@ -167,6 +167,49 @@ type ScannerState struct {
 	// the end, since its in-memory map still has the old, pre-reset entry.
 	TouchedRepos    map[string]bool `json:"-"`
 	TouchedReleases map[string]bool `json:"-"`
+
+	// SyncedThisRun records "name@version" release keys already confirmed
+	// posted during this run (either just-created, or found to pre-exist
+	// via releaseVersionExists). Not persisted -- it exists purely to
+	// avoid a redundant sync within a single run when the same name+
+	// version recurs across multiple parents (e.g. a Helm chart
+	// referencing the same unchanged image tag across several chart
+	// releases in a row, as DeployHub-Pro's do). releaseVersionExists
+	// hits the DB directly and is the real source of truth, but relying
+	// on it alone within a run can race a backend that persists releases
+	// asynchronously after the API responds 201 -- a check moments after
+	// our own successful post can come back "not found" even though the
+	// post already succeeded, triggering a needless full re-scan
+	// (git clone, SBOM generation, etc.) of content we just processed.
+	SyncedThisRun map[string]bool `json:"-"`
+
+	// SyncedReleaseKeys persists "name@version" release keys this
+	// scanner has personally confirmed synced across PAST runs, not just
+	// the current one. It exists because releaseVersionExists has been
+	// observed to still report "not found" for certain chart-image
+	// releases even 15+ minutes after a successful post -- long enough
+	// that a simple write-visibility race no longer explains it, and the
+	// live DB check can no longer be trusted alone for these. Checking
+	// this local memory first (see releaseAlreadySynced) means a key
+	// this process has ever confirmed stays skipped forever afterward,
+	// regardless of whatever is going on with the DB/API's read path.
+	// The live DB check remains the fallback for any key this map hasn't
+	// seen before (new process, cold state, or a key synced by some
+	// other client entirely).
+	//
+	// NOTE: unlike ProcessedRepos/ProcessedReleases (one high-water-mark
+	// ID per repo), this is an open-ended growing set -- an unmodified
+	// image tag can recur unpredictably far in the future, so there's no
+	// safe point to stop remembering a key. If this map grows large
+	// enough to matter, it will need periodic pruning (e.g. drop entries
+	// past some retention window) -- not implemented here.
+	SyncedReleaseKeys map[string]bool `json:"synced_release_keys,omitempty"`
+
+	// TouchedSyncedReleaseKeys mirrors TouchedRepos/TouchedReleases: only
+	// keys actually confirmed by THIS run get merged into the persisted
+	// document in saveScannerState, so a long-running scan never stomps
+	// keys recorded by a different run that finished first.
+	TouchedSyncedReleaseKeys map[string]bool `json:"-"`
 }
 
 func newScannerState() *ScannerState {
@@ -176,6 +219,10 @@ func newScannerState() *ScannerState {
 		ProcessedReleases: make(map[string]ReleaseScanState),
 		TouchedRepos:      make(map[string]bool),
 		TouchedReleases:   make(map[string]bool),
+		SyncedThisRun:     make(map[string]bool),
+		SyncedReleaseKeys: make(map[string]bool),
+
+		TouchedSyncedReleaseKeys: make(map[string]bool),
 	}
 }
 
@@ -199,8 +246,13 @@ func loadScannerState(ctx context.Context, dbConn *database.DBConnection) (*Scan
 		if state.ProcessedReleases == nil {
 			state.ProcessedReleases = make(map[string]ReleaseScanState)
 		}
+		if state.SyncedReleaseKeys == nil {
+			state.SyncedReleaseKeys = make(map[string]bool)
+		}
 		state.TouchedRepos = make(map[string]bool)
 		state.TouchedReleases = make(map[string]bool)
+		state.SyncedThisRun = make(map[string]bool)
+		state.TouchedSyncedReleaseKeys = make(map[string]bool)
 		return &state, nil
 	}
 	return newScannerState(), nil
@@ -234,30 +286,39 @@ func saveScannerState(ctx context.Context, dbConn *database.DBConnection, state 
 	for key := range state.TouchedReleases {
 		releaseUpdates[key] = state.ProcessedReleases[key]
 	}
+	syncedKeyUpdates := make(map[string]bool, len(state.TouchedSyncedReleaseKeys))
+	for key := range state.TouchedSyncedReleaseKeys {
+		syncedKeyUpdates[key] = true
+	}
 
 	query := `
 		LET current = DOCUMENT("metadata/relscanner_state")
 		LET currentRepos = current != null && current.processed_repos != null ? current.processed_repos : {}
 		LET currentReleases = current != null && current.processed_releases != null ? current.processed_releases : {}
+		LET currentSyncedKeys = current != null && current.synced_release_keys != null ? current.synced_release_keys : {}
 		LET mergedRepos = MERGE(currentRepos, @repoUpdates)
 		LET mergedReleases = MERGE(currentReleases, @releaseUpdates)
+		LET mergedSyncedKeys = MERGE(currentSyncedKeys, @syncedKeyUpdates)
 		UPSERT { _key: "relscanner_state" }
 		INSERT {
 			_key: "relscanner_state",
 			processed_repos: mergedRepos,
 			processed_releases: mergedReleases,
+			synced_release_keys: mergedSyncedKeys,
 			last_scanned_at: DATE_ISO8601(DATE_NOW())
 		}
 		UPDATE {
 			processed_repos: mergedRepos,
 			processed_releases: mergedReleases,
+			synced_release_keys: mergedSyncedKeys,
 			last_scanned_at: DATE_ISO8601(DATE_NOW())
 		}
 		IN metadata
 	`
 	bindVars := map[string]interface{}{
-		"repoUpdates":    repoUpdates,
-		"releaseUpdates": releaseUpdates,
+		"repoUpdates":      repoUpdates,
+		"releaseUpdates":   releaseUpdates,
+		"syncedKeyUpdates": syncedKeyUpdates,
 	}
 	_, err := dbConn.Database.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars})
 	return err
@@ -833,6 +894,83 @@ func releaseVersionExists(ctx context.Context, dbConn database.DBConnection, rel
 	return cursor.HasMore(), nil
 }
 
+// syncKey builds the in-run dedup key used by releaseAlreadySynced /
+// markReleaseSynced for a given release name+version pair.
+func syncKey(releaseName, version string) string {
+	return releaseName + "@" + version
+}
+
+// releaseAlreadySynced is releaseVersionExists plus an in-run cache
+// (state.SyncedThisRun) checked first. The DB query alone is not enough to
+// prevent duplicate work within a single run: if the backend persists a
+// posted release asynchronously (after the API already returned 201), a
+// releaseVersionExists check moments after our own successful post for
+// that exact name+version can still come back "not found," causing a full
+// redundant re-scan. This is exactly what happens when a Helm chart
+// references the same unchanged image tag across several consecutive
+// source releases -- see postImageSBOMRelease. The in-run cache sidesteps
+// that race entirely for anything we've already confirmed (created or
+// found existing) earlier in this same run, while still falling back to
+// the authoritative DB check for anything not yet seen this run (e.g.
+// releases synced by a previous run).
+func releaseAlreadySynced(ctx context.Context, dbConn database.DBConnection, state *ScannerState, releaseName, version string) (bool, error) {
+	key := syncKey(releaseName, version)
+
+	if state != nil {
+		if state.SyncedThisRun == nil {
+			state.SyncedThisRun = make(map[string]bool)
+		}
+		if state.SyncedThisRun[key] {
+			return true, nil
+		}
+		if state.SyncedReleaseKeys != nil && state.SyncedReleaseKeys[key] {
+			// This process has confirmed this exact key in some past run.
+			// Trust that local memory over a fresh DB read: the live
+			// check has been observed to still report "not found" for
+			// certain releases well past any reasonable write-visibility
+			// window, so re-querying it here would just reproduce the
+			// same false negative and redo the whole scan for nothing.
+			state.SyncedThisRun[key] = true
+			return true, nil
+		}
+	}
+
+	exists, err := releaseVersionExists(ctx, dbConn, releaseName, version)
+	if err != nil {
+		return false, err
+	}
+	if exists {
+		markReleaseSynced(state, releaseName, version)
+	}
+	return exists, nil
+}
+
+// markReleaseSynced records that releaseName@version has been confirmed
+// synced (created or already-existing) both for the remainder of this run
+// (SyncedThisRun) and persistently across future runs (SyncedReleaseKeys,
+// written back to the DB by saveScannerState via TouchedSyncedReleaseKeys).
+func markReleaseSynced(state *ScannerState, releaseName, version string) {
+	if state == nil {
+		return
+	}
+	key := syncKey(releaseName, version)
+
+	if state.SyncedThisRun == nil {
+		state.SyncedThisRun = make(map[string]bool)
+	}
+	state.SyncedThisRun[key] = true
+
+	if state.SyncedReleaseKeys == nil {
+		state.SyncedReleaseKeys = make(map[string]bool)
+	}
+	state.SyncedReleaseKeys[key] = true
+
+	if state.TouchedSyncedReleaseKeys == nil {
+		state.TouchedSyncedReleaseKeys = make(map[string]bool)
+	}
+	state.TouchedSyncedReleaseKeys[key] = true
+}
+
 // findEarliestMissingReleaseID scans a repo's GitHub releases (newest-first,
 // GitHub's default order) looking for gaps at or below the current watermark
 // — releases that were silently skipped by the old high-water-mark bug.
@@ -992,7 +1130,7 @@ func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnecti
 	sort.Slice(pending, func(i, j int) bool { return pending[i].GetID() > pending[j].GetID() })
 
 	for _, ghRelease := range pending {
-		if err := processGitHubSourceRelease(ctx, dbConn, client, token, owner, repoName, ghRelease, isPublic); err != nil {
+		if err := processGitHubSourceRelease(ctx, dbConn, client, token, owner, repoName, ghRelease, isPublic, state); err != nil {
 			log.Printf("      ⚠️  source release %s/%s %s failed: %v", owner, repoName, ghRelease.GetTagName(), err)
 			continue
 		}
@@ -1019,7 +1157,7 @@ func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnecti
 	return nil
 }
 
-func processGitHubSourceRelease(ctx context.Context, dbConn database.DBConnection, client *github.Client, token, owner, repoName string, ghRelease *github.RepositoryRelease, isPublic bool) error {
+func processGitHubSourceRelease(ctx context.Context, dbConn database.DBConnection, client *github.Client, token, owner, repoName string, ghRelease *github.RepositoryRelease, isPublic bool, state *ScannerState) error {
 	tagName := ghRelease.GetTagName()
 	version := releaseVersionFromGitHubRelease(owner, repoName, ghRelease)
 	if version == "" {
@@ -1028,7 +1166,7 @@ func processGitHubSourceRelease(ctx context.Context, dbConn database.DBConnectio
 
 	releaseName := fmt.Sprintf("%s/%s", owner, repoName)
 	sourceExists := false
-	if exists, err := releaseVersionExists(ctx, dbConn, releaseName, version); err != nil {
+	if exists, err := releaseAlreadySynced(ctx, dbConn, state, releaseName, version); err != nil {
 		log.Printf("      ⚠️  failed to check existing release for %s %s: %v", releaseName, version, err)
 	} else {
 		sourceExists = exists
@@ -1215,6 +1353,7 @@ func processGitHubSourceRelease(ctx context.Context, dbConn database.DBConnectio
 		if err := postRelease(serverURL, req); err != nil {
 			return err
 		}
+		markReleaseSynced(state, releaseName, version)
 
 		log.Printf("      🚀 Source release %s/%s %s synced (SHA: %s)", owner, repoName, version, release.ContentSha)
 	}
@@ -1238,7 +1377,7 @@ func processGitHubSourceRelease(ctx context.Context, dbConn database.DBConnectio
 
 		log.Printf("      🔍 Helm chart %s for %s/%s %s references %d image(s)", filepath.Base(chartDir), owner, repoName, tagName, len(images))
 		for _, image := range images {
-			if err := postImageSBOMRelease(ctx, dbConn, image, owner, repoName, gitURL, commitSHA, isPublic); err != nil {
+			if err := postImageSBOMRelease(ctx, dbConn, state, image, owner, repoName, gitURL, commitSHA, isPublic); err != nil {
 				log.Printf("      ⚠️  failed to sync SBOM release for chart image %s (from %s/%s %s): %v", image, owner, repoName, tagName, err)
 			}
 		}
@@ -1621,7 +1760,7 @@ func extractImagesFromManifest(manifest []byte) []string {
 // for every other image SBOM in this scanner) and posts it as its own
 // release, separate from the chart's own source release, so each image gets
 // independent CVE matching.
-func postImageSBOMRelease(ctx context.Context, dbConn database.DBConnection, imageRef, sourceOwner, sourceRepoName, sourceGitURL, sourceCommit string, isPublic bool) error {
+func postImageSBOMRelease(ctx context.Context, dbConn database.DBConnection, state *ScannerState, imageRef, sourceOwner, sourceRepoName, sourceGitURL, sourceCommit string, isPublic bool) error {
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
 		return fmt.Errorf("invalid image reference %q: %w", imageRef, err)
@@ -1652,7 +1791,7 @@ func postImageSBOMRelease(ctx context.Context, dbConn database.DBConnection, ima
 	// process gets OOMKilled partway through a batch (as this one has been),
 	// the images already synced before the crash get redone too, since the
 	// in-memory watermark for that never made it to a save point.
-	if exists, err := releaseVersionExists(ctx, dbConn, compName, dockerTag); err != nil {
+	if exists, err := releaseAlreadySynced(ctx, dbConn, state, compName, dockerTag); err != nil {
 		log.Printf("      ⚠️  failed to check existing release for %s %s: %v", compName, dockerTag, err)
 	} else if exists {
 		log.Printf("      ⏭️  Chart image release %s already exists, skipping", imageRef)
@@ -1701,6 +1840,7 @@ func postImageSBOMRelease(ctx context.Context, dbConn database.DBConnection, ima
 	if err := postRelease(serverURL, req); err != nil {
 		return err
 	}
+	markReleaseSynced(state, compName, dockerTag)
 
 	log.Printf("      🚀 Chart image release %s synced (SHA: %s)", imageRef, release.ContentSha)
 	return nil
