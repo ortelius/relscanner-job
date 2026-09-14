@@ -3,17 +3,17 @@ module relscanner
 go 1.27.1
 
 require (
-	github.com/anchore/syft v1.51.0
-	github.com/arangodb/go-driver/v2 v2.3.1
+	github.com/anchore/syft v1.51.1
+	github.com/arangodb/go-driver/v2 v2.4.0
 	github.com/glebarez/go-sqlite v1.23.0
 	github.com/go-enry/go-enry/v2 v2.9.6
 	github.com/golang-jwt/jwt/v5 v5.3.1
-	github.com/google/go-containerregistry v0.21.9
-	github.com/google/go-github/v69 v69.2.0
-	github.com/ortelius/ortelius/v12 v12.0.520
+	github.com/google/go-containerregistry v0.22.1
+	github.com/google/go-github/v91 v91.0.0
+	github.com/ortelius/ortelius/v12 v12.0.529
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/oauth2 v0.36.0
-	helm.sh/helm/v4 v4.2.4
+	helm.sh/helm/v4 v4.3.0
 )
 
 // Pinned to match helm.sh/helm/v4 v4.2.4's own go.mod exactly. Helm's SDK
@@ -394,20 +394,20 @@ require (
 // against. Unlike the v3 SDK, v4 moved from docker/docker-based oras-go v1
 // to oras.land/oras-go/v2, so no docker/docker replace is needed here.
 replace (
-	k8s.io/api => k8s.io/api v0.36.1
-	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.36.1
-	k8s.io/apimachinery => k8s.io/apimachinery v0.36.1
-	k8s.io/apiserver => k8s.io/apiserver v0.36.1
-	k8s.io/cli-runtime => k8s.io/cli-runtime v0.36.1
-	k8s.io/client-go => k8s.io/client-go v0.36.1
-	k8s.io/component-base => k8s.io/component-base v0.36.1
+	k8s.io/api => k8s.io/api v0.37.0
+	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.37.0
+	k8s.io/apimachinery => k8s.io/apimachinery v0.37.0
+	k8s.io/apiserver => k8s.io/apiserver v0.37.0
+	k8s.io/cli-runtime => k8s.io/cli-runtime v0.37.0
+	k8s.io/client-go => k8s.io/client-go v0.37.0
+	k8s.io/component-base => k8s.io/component-base v0.37.0
 	k8s.io/klog/v2 => k8s.io/klog/v2 v2.140.0
-	k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20260317180543-43fb72c5454a
-	k8s.io/kubectl => k8s.io/kubectl v0.36.1
-	k8s.io/utils => k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2
-	sigs.k8s.io/json => sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730
+	k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20260911184034-7970a1e230da
+	k8s.io/kubectl => k8s.io/kubectl v0.37.0
+	k8s.io/utils => k8s.io/utils v0.0.0-20260707023825-cf1189d6abe3
+	sigs.k8s.io/json => sigs.k8s.io/json v0.0.0-20260909141634-11ed52e25bc5
 	sigs.k8s.io/kustomize/api => sigs.k8s.io/kustomize/api v0.21.1
 	sigs.k8s.io/kustomize/kyaml => sigs.k8s.io/kustomize/kyaml v0.21.1
-	sigs.k8s.io/structured-merge-diff/v6 => sigs.k8s.io/structured-merge-diff/v6 v6.3.2
+	sigs.k8s.io/structured-merge-diff/v7 => sigs.k8s.io/structured-merge-diff/v6 v7.0.0
 	sigs.k8s.io/yaml => sigs.k8s.io/yaml v1.6.0
 )
