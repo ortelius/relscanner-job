@@ -364,7 +364,7 @@ func runScanner(_ *cobra.Command, _ []string) error {
 		for userCursor.HasMore() {
 			var user model.User
 			if _, err := userCursor.ReadDocument(ctx, &user); err == nil {
-				processUserInstallation(ctx, dbConn, user.GitHubInstallationID, user.Username, state)
+				processUserInstallation(ctx, dbConn, user, state)
 			}
 		}
 	}
@@ -398,7 +398,7 @@ func runScanner(_ *cobra.Command, _ []string) error {
 
 				switch trackedRepo.Provider {
 				case "github":
-					if err := processTrackedGitHubRepo(ctx, dbConn, token, trackedRepo.Owner, trackedRepo.Name, !trackedRepo.Private, state); err != nil {
+					if err := processTrackedGitHubRepo(ctx, dbConn, token, trackedRepo.Owner, trackedRepo.Name, !trackedRepo.Private, state, trackedRepo.Mapping); err != nil {
 						log.Printf("⚠️  error processing %s/%s: %v", trackedRepo.Owner, trackedRepo.Name, err)
 					}
 				case "gitlab":
@@ -438,7 +438,7 @@ func runScanner(_ *cobra.Command, _ []string) error {
 
 			switch repo.Provider {
 			case "github":
-				if err := processTrackedGitHubRepo(ctx, dbConn, token, repo.Owner, repo.Name, true, state); err != nil {
+				if err := processTrackedGitHubRepo(ctx, dbConn, token, repo.Owner, repo.Name, true, state, model.RepoMapping{}); err != nil {
 					log.Printf("      ⚠️  error processing public github %s/%s: %v", repo.Owner, repo.Name, err)
 				}
 			case "gitlab":
@@ -550,7 +550,7 @@ func newGitHubClient(ctx context.Context, token string) *github.Client {
 }
 
 // processTrackedGitHubRepo processes a single GitHub repo from an org's tracked_repos list.
-func processTrackedGitHubRepo(ctx context.Context, dbConn database.DBConnection, token, owner, repoName string, isPublic bool, state *ScannerState) error {
+func processTrackedGitHubRepo(ctx context.Context, dbConn database.DBConnection, token, owner, repoName string, isPublic bool, state *ScannerState, repoMapping model.RepoMapping) error {
 	repoKey := fmt.Sprintf("github/%s/%s", owner, repoName)
 
 	if state.VisitedThisRun == nil {
@@ -573,15 +573,20 @@ func processTrackedGitHubRepo(ctx context.Context, dbConn database.DBConnection,
 		return nil
 	}
 
-	if err := processSingleRepo(ctx, client, token, owner, repoName, isPublic, state.ProcessedRepos, state.TouchedRepos); err != nil {
+	if err := processSingleRepo(ctx, dbConn, client, token, owner, repoName, isPublic, state.ProcessedRepos, state.TouchedRepos, repoMapping); err != nil {
 		log.Printf("      ⚠️  workflow scan skipped for %s/%s: %v", owner, repoName, err)
 	}
 
-	return processGitHubSourceReleases(ctx, dbConn, client, token, owner, repoName, isPublic, state)
+	return processGitHubSourceReleases(ctx, dbConn, client, token, owner, repoName, isPublic, state, repoMapping)
 }
 
-func processUserInstallation(ctx context.Context, dbConn database.DBConnection, installationID, _ string, state *ScannerState) error {
-	token, err := getInstallationToken(envAppID, envPrivateKey, installationID)
+// processUserInstallation walks every repo a GitHub App installation can
+// see and processes each one. user.GitHubRepoMappings carries the optional
+// artifact-namespace/gitops-endpoint mapping entered per repo on the
+// welcome page (keyed by full_name), looked up per repo below so it keeps
+// applying to releases discovered on every future scan cycle.
+func processUserInstallation(ctx context.Context, dbConn database.DBConnection, user model.User, state *ScannerState) error {
+	token, err := getInstallationToken(envAppID, envPrivateKey, user.GitHubInstallationID)
 	if err != nil {
 		return err
 	}
@@ -598,11 +603,15 @@ func processUserInstallation(ctx context.Context, dbConn database.DBConnection, 
 		}
 		for _, repo := range repos.Repositories {
 			if !repo.GetArchived() {
-				if err := processSingleRepo(ctx, client, token, repo.GetOwner().GetLogin(), repo.GetName(), !repo.GetPrivate(), state.ProcessedRepos, state.TouchedRepos); err != nil {
-					log.Printf("      ⚠️  workflow scan skipped for %s/%s: %v", repo.GetOwner().GetLogin(), repo.GetName(), err)
+				owner := repo.GetOwner().GetLogin()
+				repoName := repo.GetName()
+				repoMapping := user.GitHubRepoMappings[fmt.Sprintf("%s/%s", owner, repoName)]
+
+				if err := processSingleRepo(ctx, dbConn, client, token, owner, repoName, !repo.GetPrivate(), state.ProcessedRepos, state.TouchedRepos, repoMapping); err != nil {
+					log.Printf("      ⚠️  workflow scan skipped for %s/%s: %v", owner, repoName, err)
 				}
-				if err := processGitHubSourceReleases(ctx, dbConn, client, token, repo.GetOwner().GetLogin(), repo.GetName(), !repo.GetPrivate(), state); err != nil {
-					log.Printf("      ⚠️  source-release scan skipped for %s/%s: %v", repo.GetOwner().GetLogin(), repo.GetName(), err)
+				if err := processGitHubSourceReleases(ctx, dbConn, client, token, owner, repoName, !repo.GetPrivate(), state, repoMapping); err != nil {
+					log.Printf("      ⚠️  source-release scan skipped for %s/%s: %v", owner, repoName, err)
 				}
 			}
 		}
@@ -614,7 +623,7 @@ func processUserInstallation(ctx context.Context, dbConn database.DBConnection, 
 	return nil
 }
 
-func processSingleRepo(ctx context.Context, client *github.Client, token, owner, repoName string, isPublic bool, processedRepos map[string]int64, touchedRepos map[string]bool) error {
+func processSingleRepo(ctx context.Context, dbConn database.DBConnection, client *github.Client, token, owner, repoName string, isPublic bool, processedRepos map[string]int64, touchedRepos map[string]bool, repoMapping model.RepoMapping) error {
 	repoKey := fmt.Sprintf("github/%s/%s", owner, repoName)
 	lastProcessedID := processedRepos[repoKey]
 
@@ -638,7 +647,7 @@ func processSingleRepo(ctx context.Context, client *github.Client, token, owner,
 			continue
 		}
 
-		if err := processWorkflowScanTarget(ctx, client, token, owner, repoName, isPublic, processedRepos, touchedRepos, target); err != nil {
+		if err := processWorkflowScanTarget(ctx, dbConn, client, token, owner, repoName, isPublic, processedRepos, touchedRepos, target, repoMapping); err != nil {
 			lastErr = err
 			log.Printf("      ⚠️  workflow run %s/%s %d failed: %v", owner, repoName, target.RunID, err)
 			continue
@@ -666,6 +675,7 @@ func processSingleRepo(ctx context.Context, client *github.Client, token, owner,
 
 func processWorkflowScanTarget(
 	ctx context.Context,
+	dbConn database.DBConnection,
 	client *github.Client,
 	token string,
 	owner string,
@@ -674,6 +684,7 @@ func processWorkflowScanTarget(
 	processedRepos map[string]int64,
 	touchedRepos map[string]bool,
 	target WorkflowScanTarget,
+	repoMapping model.RepoMapping,
 ) error {
 	runID := target.RunID
 	commitSHA := target.CommitSHA
@@ -765,6 +776,13 @@ func processWorkflowScanTarget(
 		mapping["ProjectType"] = "application"
 	}
 
+	if repoMapping.ArtifactNamespace != "" {
+		// Overrides whatever DockerRepo was derived above with the
+		// namespace the user mapped this repo to on the welcome page, e.g.
+		// "deployhub" + "DeployHub-Pro" -> "deployhub/DeployHub-Pro".
+		mapping["DockerRepo"] = fmt.Sprintf("%s/%s", repoMapping.ArtifactNamespace, repoName)
+	}
+
 	if commitForMetadata := mapping["GitCommit"]; commitForMetadata != "" {
 		gitMeta := collectGitScanMetadata(tempDir, commitForMetadata)
 		applyGitScanMetadata(mapping, gitMeta)
@@ -834,6 +852,7 @@ func processWorkflowScanTarget(
 	if err := postRelease(serverURL, req); err != nil {
 		return err
 	}
+	syncGitopsEndpoint(ctx, dbConn, release.Name, release.Version, repoMapping.GitopsEndpoint)
 
 	processedRepos[repoKey] = runID
 	touchedRepos[repoKey] = true
@@ -1057,7 +1076,7 @@ func resetWatermarkOnGap(ctx context.Context, dbConn database.DBConnection, clie
 	return nil
 }
 
-func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnection, client *github.Client, token, owner, repoName string, isPublic bool, state *ScannerState) error {
+func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnection, client *github.Client, token, owner, repoName string, isPublic bool, state *ScannerState, repoMapping model.RepoMapping) error {
 	// newRepoMaxReleases caps the very first scan of a repo to just its most
 	// recent releases — that's the desired steady-state behavior, not a bug.
 	// backfillMaxReleases is used once a repo already has a watermark (i.e.
@@ -1130,7 +1149,7 @@ func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnecti
 	sort.Slice(pending, func(i, j int) bool { return pending[i].GetID() > pending[j].GetID() })
 
 	for _, ghRelease := range pending {
-		if err := processGitHubSourceRelease(ctx, dbConn, client, token, owner, repoName, ghRelease, isPublic, state); err != nil {
+		if err := processGitHubSourceRelease(ctx, dbConn, client, token, owner, repoName, ghRelease, isPublic, state, repoMapping); err != nil {
 			log.Printf("      ⚠️  source release %s/%s %s failed: %v", owner, repoName, ghRelease.GetTagName(), err)
 			continue
 		}
@@ -1157,7 +1176,7 @@ func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnecti
 	return nil
 }
 
-func processGitHubSourceRelease(ctx context.Context, dbConn database.DBConnection, client *github.Client, token, owner, repoName string, ghRelease *github.RepositoryRelease, isPublic bool, state *ScannerState) error {
+func processGitHubSourceRelease(ctx context.Context, dbConn database.DBConnection, client *github.Client, token, owner, repoName string, ghRelease *github.RepositoryRelease, isPublic bool, state *ScannerState, repoMapping model.RepoMapping) error {
 	tagName := ghRelease.GetTagName()
 	version := releaseVersionFromGitHubRelease(owner, repoName, ghRelease)
 	if version == "" {
@@ -1332,6 +1351,10 @@ func processGitHubSourceRelease(ctx context.Context, dbConn database.DBConnectio
 		mapping["GitUrl"] = gitURL
 		mapping["ProjectType"] = "application"
 
+		if repoMapping.ArtifactNamespace != "" {
+			mapping["DockerRepo"] = fmt.Sprintf("%s/%s", repoMapping.ArtifactNamespace, repoName)
+		}
+
 		if commitSHA != "" {
 			gitMeta := collectGitScanMetadata(tempDir, commitSHA)
 			applyGitScanMetadata(mapping, gitMeta)
@@ -1354,6 +1377,7 @@ func processGitHubSourceRelease(ctx context.Context, dbConn database.DBConnectio
 			return err
 		}
 		markReleaseSynced(state, releaseName, version)
+		syncGitopsEndpoint(ctx, dbConn, releaseName, version, repoMapping.GitopsEndpoint)
 
 		log.Printf("      🚀 Source release %s/%s %s synced (SHA: %s)", owner, repoName, version, release.ContentSha)
 	}
@@ -1377,7 +1401,7 @@ func processGitHubSourceRelease(ctx context.Context, dbConn database.DBConnectio
 
 		log.Printf("      🔍 Helm chart %s for %s/%s %s references %d image(s)", filepath.Base(chartDir), owner, repoName, tagName, len(images))
 		for _, image := range images {
-			if err := postImageSBOMRelease(ctx, dbConn, state, image, owner, repoName, gitURL, commitSHA, isPublic); err != nil {
+			if err := postImageSBOMRelease(ctx, dbConn, state, image, owner, repoName, gitURL, commitSHA, isPublic, repoMapping); err != nil {
 				log.Printf("      ⚠️  failed to sync SBOM release for chart image %s (from %s/%s %s): %v", image, owner, repoName, tagName, err)
 			}
 		}
@@ -1760,7 +1784,14 @@ func extractImagesFromManifest(manifest []byte) []string {
 // for every other image SBOM in this scanner) and posts it as its own
 // release, separate from the chart's own source release, so each image gets
 // independent CVE matching.
-func postImageSBOMRelease(ctx context.Context, dbConn database.DBConnection, state *ScannerState, imageRef, sourceOwner, sourceRepoName, sourceGitURL, sourceCommit string, isPublic bool) error {
+// postImageSBOMRelease intentionally does NOT apply repoMapping.ArtifactNamespace
+// to this release's DockerRepo -- see the imgOrg comment below: a chart can
+// reference images published under several different orgs, so the image's
+// own registry namespace is always the correct DockerRepo, not the chart
+// repo's mapped namespace. repoMapping.GitopsEndpoint IS applied, though:
+// these image releases are the actual gitops-deployed artifacts, so they're
+// what should be linked to the mapped runtime endpoint.
+func postImageSBOMRelease(ctx context.Context, dbConn database.DBConnection, state *ScannerState, imageRef, sourceOwner, sourceRepoName, sourceGitURL, sourceCommit string, isPublic bool, repoMapping model.RepoMapping) error {
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
 		return fmt.Errorf("invalid image reference %q: %w", imageRef, err)
@@ -1841,9 +1872,41 @@ func postImageSBOMRelease(ctx context.Context, dbConn database.DBConnection, sta
 		return err
 	}
 	markReleaseSynced(state, compName, dockerTag)
+	syncGitopsEndpoint(ctx, dbConn, compName, dockerTag, repoMapping.GitopsEndpoint)
 
 	log.Printf("      🚀 Chart image release %s synced (SHA: %s)", imageRef, release.ContentSha)
 	return nil
+}
+
+// syncGitopsEndpoint links a release to the runtime endpoint/namespace the
+// user mapped this repo to on the welcome page (RepoMapping.GitopsEndpoint,
+// formatted "<endpoint name>/<namespace>") -- the same Endpoint+Sync shape a
+// real cluster sync produces, so gitops repos show up correlated with where
+// they actually run instead of only under the github-actions/ CI endpoint.
+// No-op when gitopsEndpoint or releaseVersion is empty, so callers can pass
+// it unconditionally.
+func syncGitopsEndpoint(ctx context.Context, dbConn database.DBConnection, releaseName, releaseVersion, gitopsEndpoint string) {
+	gitopsEndpoint = strings.TrimSpace(gitopsEndpoint)
+	if gitopsEndpoint == "" || releaseVersion == "" {
+		return
+	}
+
+	endpoint := model.NewEndpoint()
+	endpoint.Name = gitopsEndpoint
+	endpoint.EndpointType = model.EndpointTypeCluster
+	endpoint.Environment = "production"
+	endpoint.ParseAndSetNameComponents()
+	// Ignore duplicate-key errors -- the endpoint may already exist from a
+	// real cluster sync (Synced Endpoints) or a previous scan cycle.
+	dbConn.Collections["endpoint"].CreateDocument(ctx, endpoint)
+
+	sync := model.NewSync()
+	sync.EndpointName = gitopsEndpoint
+	sync.ReleaseName = releaseName
+	sync.ReleaseVersion = releaseVersion
+	if _, err := dbConn.Collections["sync"].CreateDocument(ctx, sync); err != nil {
+		log.Printf("      ⚠️  failed to sync gitops endpoint %s for %s@%s: %v", gitopsEndpoint, releaseName, releaseVersion, err)
+	}
 }
 
 // minimalImageSBOM is the last-resort SBOM for a chart-referenced image when
