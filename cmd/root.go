@@ -595,6 +595,14 @@ func processUserInstallation(ctx context.Context, dbConn database.DBConnection, 
 	tc := oauth2.NewClient(ctx, ts)
 	client := github.NewClient(tc)
 
+	// Only repos the user explicitly onboarded (Welcome page / POST
+	// /github/onboard) are scanned. The installation may see many more repos;
+	// those are ignored. An empty allow-list scans nothing.
+	scanned := make(map[string]bool, len(user.GitHubScannedRepos))
+	for _, k := range user.GitHubScannedRepos {
+		scanned[strings.ToLower(strings.TrimSpace(k))] = true
+	}
+
 	opt := &github.ListOptions{PerPage: 100}
 	for {
 		repos, resp, err := client.Apps.ListRepos(ctx, opt)
@@ -605,6 +613,9 @@ func processUserInstallation(ctx context.Context, dbConn database.DBConnection, 
 			if !repo.GetArchived() {
 				owner := repo.GetOwner().GetLogin()
 				repoName := repo.GetName()
+				if !scanned[strings.ToLower(owner+"/"+repoName)] {
+					continue
+				}
 				repoMapping := user.GitHubRepoMappings[fmt.Sprintf("%s/%s", owner, repoName)]
 
 				if err := processSingleRepo(ctx, dbConn, client, token, owner, repoName, !repo.GetPrivate(), state.ProcessedRepos, state.TouchedRepos, repoMapping); err != nil {
@@ -623,7 +634,28 @@ func processUserInstallation(ctx context.Context, dbConn database.DBConnection, 
 	return nil
 }
 
+// skipRepos is a scanner-wide denylist of "owner/repo" names (case-insensitive)
+// from RELSCANNER_SKIP_REPOS (comma-separated). It is checked at the two scan
+// entry points below, so it covers every pass (App installations, org
+// tracked_repos and system_tracked_repos) without needing a model change.
+var skipRepos = func() map[string]bool {
+	m := map[string]bool{}
+	for _, k := range strings.Split(os.Getenv("RELSCANNER_SKIP_REPOS"), ",") {
+		if k = strings.ToLower(strings.TrimSpace(k)); k != "" {
+			m[k] = true
+		}
+	}
+	return m
+}()
+
+func repoSkipped(owner, name string) bool {
+	return skipRepos[strings.ToLower(owner+"/"+name)]
+}
+
 func processSingleRepo(ctx context.Context, dbConn database.DBConnection, client *github.Client, token, owner, repoName string, isPublic bool, processedRepos map[string]int64, touchedRepos map[string]bool, repoMapping model.RepoMapping) error {
+	if repoSkipped(owner, repoName) {
+		return nil
+	}
 	repoKey := fmt.Sprintf("github/%s/%s", owner, repoName)
 	lastProcessedID := processedRepos[repoKey]
 
@@ -1077,6 +1109,9 @@ func resetWatermarkOnGap(ctx context.Context, dbConn database.DBConnection, clie
 }
 
 func processGitHubSourceReleases(ctx context.Context, dbConn database.DBConnection, client *github.Client, token, owner, repoName string, isPublic bool, state *ScannerState, repoMapping model.RepoMapping) error {
+	if repoSkipped(owner, repoName) {
+		return nil
+	}
 	// newRepoMaxReleases caps the very first scan of a repo to just its most
 	// recent releases — that's the desired steady-state behavior, not a bug.
 	// backfillMaxReleases is used once a repo already has a watermark (i.e.
