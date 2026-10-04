@@ -1,4 +1,4 @@
-FROM public.ecr.aws/amazonlinux/amazonlinux:2023.12.20260803.3@sha256:6d8e068b91f351df5bf6acd4bd261316e42747ad4bae76689ff6f4939e2180a2
+FROM public.ecr.aws/amazonlinux/amazonlinux:2027.0.20260928.1@sha256:3ad14f0ff21381755f96e7c44d4f3bbe12bd8369214d1f9b17e78842441f98dd
 
 WORKDIR /app
 
