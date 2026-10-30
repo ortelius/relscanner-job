@@ -2,6 +2,17 @@ apiVersion: v1
 entries:
   relscanner-job:
   - apiVersion: v2
+    appVersion: 12.0.1211
+    created: "2026-10-30T22:34:37.79160027Z"
+    description: Release Scanner Worker
+    digest: 9e71833a3dc462f49130d66fd5f7b3219df4ff5a512240102db3af9b989ba983
+    icon: https://ortelius.github.io/parent-charts/ortelius.svg
+    name: relscanner-job
+    type: application
+    urls:
+    - https://github.com/ortelius/relscanner-job/releases/download/v12.0.1211/relscanner-job-12.0.1211.tgz
+    version: 12.0.1211
+  - apiVersion: v2
     appVersion: 12.0.1207
     created: "2026-10-30T21:57:47.977486319Z"
     description: Release Scanner Worker
@@ -397,4 +408,4 @@ entries:
     urls:
     - https://github.com/ortelius/relscanner-job/releases/download/v12.0.18/relscanner-job-12.0.18.tgz
     version: 12.0.18
-generated: "2026-10-30T21:57:47.977026938Z"
+generated: "2026-10-30T22:34:37.791107405Z"
