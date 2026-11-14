@@ -1,5 +1,5 @@
 # ---------- Build stage ----------
-FROM public.ecr.aws/amazonlinux/amazonlinux:2027.0.20261026.1-minimal AS build
+FROM public.ecr.aws/amazonlinux/amazonlinux:2027.0.20261112.1-minimal@sha256:5aa5f02d5239bd42a38061f74ca53eb82f88428d26302a3d923dc9d957ad895b AS build
 
 ENV GO_VERSION=1.27.3
 ENV PATH=/usr/local/go/bin:$PATH
@@ -23,7 +23,7 @@ RUN go mod tidy && \
     go build -o main . 
 
 # ---------- Runtime stage ----------
-FROM public.ecr.aws/amazonlinux/amazonlinux:2027.0.20261026.1-minimal
+FROM public.ecr.aws/amazonlinux/amazonlinux:2027.0.20261112.1-minimal@sha256:5aa5f02d5239bd42a38061f74ca53eb82f88428d26302a3d923dc9d957ad895b
 
 WORKDIR /app
 
